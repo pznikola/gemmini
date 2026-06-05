@@ -41,6 +41,19 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       val write = Vec(acc_banks, Decoupled(new AccumulatorWriteReq(acc_bank_entries, Vec(meshColumns, Vec(tileColumns, accType)))))
     }
 
+    val mx = if (mx_enabled) {
+      Some(new Bundle {
+        val enable = Input(Bool())
+        val reset = Input(Bool())
+        val read_a = Decoupled(new MXScaleSRAMReadReq(mx_scale_sp_entries))
+        val read_b = Decoupled(new MXScaleSRAMReadReq(mx_scale_sp_entries))
+        val resp_a = Flipped(Valid(new MXScaleSRAMReadResp(DIM, mx_scale_bits, mx_scale_exp_bits)))
+        val resp_b = Flipped(Valid(new MXScaleSRAMReadResp(DIM, mx_scale_bits, mx_scale_exp_bits)))
+      })
+    } else {
+      None
+    }
+
     val completed = Valid(UInt(log2Up(reservation_station_entries).W))
     val busy = Output(Bool())
 
@@ -54,10 +67,16 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     val addr = local_addr_t.cloneType
     val rows = UInt(log2Up(block_size + 1).W)
     val cols = UInt(log2Up(block_size + 1).W)
+    val mx_enabled = Bool()
+    val mx_block = UInt(mx_scale_addr_bits.W)
+    val mx_second_half = Bool()
 
     override def make_this_garbage(dummy: Int = 0): Unit = {
       rob_id.valid := false.B
       addr.make_this_garbage()
+      mx_enabled := false.B
+      mx_block := 0.U
+      mx_second_half := false.B
     }
   }
 
@@ -116,9 +135,16 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val in_shift = Reg(UInt(log2Up(accType.getWidth).W))
   val acc_scale = Reg(acc_scale_t)
   val activation = if (has_nonlinear_activations) Reg(UInt(Activation.bitwidth.W)) else Activation.NONE // TODO magic number
-  val a_transpose = Reg(Bool())
-  val bd_transpose = Reg(Bool())
+  val a_transpose = RegInit(false.B)
+  val bd_transpose = RegInit(false.B)
   val config_initialized = RegInit(false.B)
+
+  val mx_runtime_enabled = if (mx_enabled) io.mx.get.enable else false.B
+  val mx_reset = if (mx_enabled) io.mx.get.reset else false.B
+  val mx_k_lane_counter = if (mx_enabled) RegInit(0.U(32.W)) else 0.U(32.W)
+  val mx_logical_block = (mx_k_lane_counter >> log2Ceil(mx_block_size)).asUInt
+  val mx_second_half = if (mx_enabled && DIM < mx_block_size) mx_k_lane_counter(log2Ceil(mx_block_size) - 1) else false.B
+  val mx_compute_active = mx_enabled.B && mx_runtime_enabled && current_dataflow === Dataflow.WS.id.U
 
   val a_should_be_fed_into_transposer = Mux(current_dataflow === Dataflow.OS.id.U, !a_transpose, a_transpose)
   val a_address_place = Mux(preload_cmd_place === 0.U, 1.U, Mux(a_should_be_fed_into_transposer, 2.U, 0.U))
@@ -186,6 +212,14 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val mesh = Module(new MeshWithDelays(spatialArrayInputType, spatialArrayWeightType, spatialArrayOutputType, accType, mesh_tag, dataflow, tree_reduction, tile_latency, mesh_output_delay,
     tileRows, tileColumns, meshRows, meshColumns, shifter_banks, shifter_banks))
 
+  if (mx_enabled) {
+    val mx = io.mx.get
+    mx.read_a.valid := false.B
+    mx.read_a.bits := DontCare
+    mx.read_b.valid := false.B
+    mx.read_b.bits := DontCare
+  }
+
   mesh.io.a.valid := false.B
   mesh.io.b.valid := false.B
   mesh.io.d.valid := false.B
@@ -197,6 +231,9 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   mesh.io.req.bits.tag := DontCare
   mesh.io.req.bits.tag.cols := cntl.c_cols
   mesh.io.req.bits.tag.rows := cntl.c_rows
+  mesh.io.req.bits.tag.mx_enabled := false.B
+  mesh.io.req.bits.tag.mx_block := 0.U
+  mesh.io.req.bits.tag.mx_second_half := false.B
   mesh.io.req.bits.total_rows := block_size.U
   mesh.io.req.bits.pe_control.propagate := Mux(control_state === flush, in_prop_flush, cntl.prop)
   mesh.io.req.bits.pe_control.dataflow := cntl.dataflow
@@ -692,6 +729,18 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     }
   }
 
+  if (mx_enabled) {
+    when (mx_reset) {
+      mx_k_lane_counter := 0.U
+    } .elsewhen (control_state === compute && about_to_fire_all_rows &&
+      (perform_single_mul || perform_mul_pre) && mx_compute_active) {
+      mx_k_lane_counter := mx_k_lane_counter + block_size.U
+    }
+
+    assert(!(mx_compute_active && (a_transpose || bd_transpose)),
+      "MXINT8 execute path v1 supports untransposed WS GEMM only")
+  }
+
   // Computing logic
   val computing = performing_mul_pre || performing_single_mul || performing_single_preload
 
@@ -745,6 +794,10 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     val im2colling = Bool()
 
     val first = Bool()
+
+    val mx_enabled = Bool()
+    val mx_block = UInt(mx_scale_addr_bits.W)
+    val mx_second_half = Bool()
   }
 
   mesh_cntl_signals_q.io.enq.valid := computing
@@ -799,6 +852,50 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   mesh_cntl_signals_q.io.enq.bits.im2colling := im2col_wire && im2col_en //im2col_wire
 
   mesh_cntl_signals_q.io.enq.bits.first := !a_fire_started && !b_fire_started && !d_fire_started
+
+  // In weight-stationary mode the matmul output is tagged with the *preload's*
+  // tag (it carries the C address), while the multiply feeds A with a garbage
+  // output address. So the MX marker must be set on the preload as well, or the
+  // BlockScaleUnit never sees mx_enabled at the output and writes the raw partial.
+  mesh_cntl_signals_q.io.enq.bits.mx_enabled := mx_compute_active &&
+    (performing_single_mul || performing_mul_pre || performing_single_preload)
+  mesh_cntl_signals_q.io.enq.bits.mx_block := mx_logical_block(mx_scale_addr_bits - 1, 0)
+  mesh_cntl_signals_q.io.enq.bits.mx_second_half := mx_second_half
+
+  val mx_b_exp = if (mx_enabled) Reg(Vec(DIM, SInt(mx_scale_exp_bits.W))) else Wire(Vec(DIM, SInt(mx_scale_exp_bits.W)))
+  val mx_b_invalid = if (mx_enabled) Reg(Vec(DIM, Bool())) else Wire(Vec(DIM, Bool()))
+  val mx_b_valid = if (mx_enabled) RegInit(false.B) else false.B
+
+  if (!mx_enabled) {
+    // These held B-scale wires are only read inside `if (mx_enabled)` blocks, so
+    // when MX is disabled they are dead. Drive them so elaboration's
+    // full-initialization check does not see undriven sinks (firtool rejects them).
+    mx_b_exp := DontCare
+    mx_b_invalid := DontCare
+  }
+
+  if (mx_enabled) {
+    val mx = io.mx.get
+    val b_scale_base = (mx_scale_sp_entries / 2).U(mx_scale_addr_bits.W)
+    val b_read_start = mesh_cntl_signals_q.io.enq.fire &&
+      mesh_cntl_signals_q.io.enq.bits.first &&
+      mesh_cntl_signals_q.io.enq.bits.mx_enabled
+
+    mx.read_b.valid := b_read_start
+    mx.read_b.bits.addr := b_scale_base + mesh_cntl_signals_q.io.enq.bits.mx_block
+
+    when (mx.read_b.fire) {
+      mx_b_valid := false.B
+    }
+    when (mx.resp_b.valid) {
+      mx_b_exp := mx.resp_b.bits.exp
+      mx_b_invalid := mx.resp_b.bits.invalid
+      mx_b_valid := true.B
+      assert(!mx.resp_b.bits.invalid.asUInt.orR, "MXINT8 B scale vector contains invalid E8M0 scale")
+    }
+
+    assert(!mx.read_b.valid || mx.read_b.ready, "MXScaleSRAM B read port must accept scale vector reads")
+  }
 
   val readData = VecInit(io.srams.read.map(_.resp.bits.data))
   val accReadData = if (ex_read_from_acc) VecInit(io.acc.read_resp.map(_.bits.data.asUInt)) else readData
@@ -883,6 +980,9 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     mesh.io.req.valid := mesh_cntl_signals_q.io.deq.fire && (cntl.a_fire || cntl.b_fire || cntl.d_fire)
 
     mesh.io.req.bits.tag.addr := cntl.c_addr
+    mesh.io.req.bits.tag.mx_enabled := cntl.mx_enabled
+    mesh.io.req.bits.tag.mx_block := cntl.mx_block
+    mesh.io.req.bits.tag.mx_second_half := cntl.mx_second_half
 
     mesh.io.req.bits.total_rows := cntl.total_rows
   }
@@ -902,27 +1002,144 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   // val output_counter = new Counter(block_size)
   val output_counter = RegInit(0.U(log2Up(block_size).W))
 
-  val w_total_output_rows = mesh.io.resp.bits.total_rows
+  val mx_delay_outputs = mx_enabled.B && mx_runtime_enabled
+  val mx_mesh_resp_valid = if (mx_enabled) RegNext(mesh.io.resp.valid, false.B) else false.B
+  val mx_mesh_resp_bits = if (mx_enabled) RegEnable(mesh.io.resp.bits, mesh.io.resp.valid) else Wire(chiselTypeOf(mesh.io.resp.bits))
+  if (!mx_enabled) {
+    // Delayed-output shadow register is only consumed inside `if (mx_enabled)`;
+    // drive it when MX is disabled to avoid an undriven sink at elaboration.
+    mx_mesh_resp_bits := DontCare
+  }
+  val mesh_resp = Wire(chiselTypeOf(mesh.io.resp.bits))
+  val mesh_resp_valid = Wire(Bool())
 
-  val w_address = Mux(current_dataflow === Dataflow.WS.id.U, mesh.io.resp.bits.tag.addr + output_counter * c_addr_stride,
-    mesh.io.resp.bits.tag.addr + (w_total_output_rows - 1.U - output_counter * c_addr_stride))
+  mesh_resp := mesh.io.resp.bits
+  mesh_resp_valid := mesh.io.resp.valid
+  if (mx_enabled) {
+    mesh_resp := Mux(mx_delay_outputs, mx_mesh_resp_bits, mesh.io.resp.bits)
+    mesh_resp_valid := Mux(mx_delay_outputs, mx_mesh_resp_valid, mesh.io.resp.valid)
+
+    val mx = io.mx.get
+    // The A-scale SRAM read is issued in the *undelayed* mesh-output domain so its
+    // 1-cycle SyncReadMem latency overlaps the 1-cycle output delay
+    // (`mx_delay_outputs`). `output_counter` advances on the *delayed* output
+    // stream and so lags the undelayed row index by one, which would feed output
+    // row i the A scale of row i-1. Track the undelayed row index with a dedicated
+    // counter that mirrors `output_counter`'s increment one cycle earlier.
+    val mx_a_read_row = RegInit(0.U(log2Up(block_size).W))
+    when (mesh.io.resp.valid && mesh.io.resp.bits.tag.rob_id.valid) {
+      mx_a_read_row := wrappingAdd(mx_a_read_row, 1.U, mesh.io.resp.bits.total_rows)
+    }
+    mx.read_a.valid := mesh.io.resp.valid && mesh.io.resp.bits.tag.mx_enabled
+    mx.read_a.bits.addr := mx_a_read_row
+    assert(!mx.read_a.valid || mx.read_a.ready, "MXScaleSRAM A read port must accept scale vector reads")
+  }
+
+  val w_total_output_rows = mesh_resp.total_rows
+
+  val w_address = Mux(current_dataflow === Dataflow.WS.id.U, mesh_resp.tag.addr + output_counter * c_addr_stride,
+    mesh_resp.tag.addr + (w_total_output_rows - 1.U - output_counter * c_addr_stride))
   val write_to_acc = w_address.is_acc_addr
 
   val w_bank = Mux(write_to_acc, w_address.acc_bank(), w_address.sp_bank())
   val w_row = Mux(write_to_acc, w_address.acc_row(), w_address.sp_row())
 
-  val is_garbage_addr = mesh.io.resp.bits.tag.addr.is_garbage()
+  val is_garbage_addr = mesh_resp.tag.addr.is_garbage()
 
-  val w_matrix_rows = mesh.io.resp.bits.tag.rows
-  val w_matrix_cols = mesh.io.resp.bits.tag.cols
+  val w_matrix_rows = mesh_resp.tag.rows
+  val w_matrix_cols = mesh_resp.tag.cols
 
   val write_this_row = Mux(current_dataflow === Dataflow.WS.id.U, output_counter < w_matrix_rows,
     w_total_output_rows - 1.U - output_counter < w_matrix_rows)
   val w_mask = (0 until block_size).map(_.U < w_matrix_cols) // This is an element-wise mask, rather than a byte-wise mask
 
+  val mx_suppress_acc_write = WireInit(false.B)
+  val mx_acc_wdata = Wire(Vec(meshColumns, Vec(tileColumns, accType)))
+  mx_acc_wdata := VecInit(mesh_resp.data.map(v => VecInit(v.map(e => e.withWidthOf(accType)))))
+
+  if (mx_enabled) {
+    val mx = io.mx.get
+    val mx_raw_half = Reg(Vec(block_size, Vec(meshColumns, Vec(tileColumns, SInt(64.W)))))
+    val mx_resp_is_scaled = mesh_resp_valid && mesh_resp.tag.mx_enabled
+    val mx_dim16_first_half = (DIM < mx_block_size).B && mx_resp_is_scaled && !mesh_resp.tag.mx_second_half
+    val mx_dim16_second_half = (DIM < mx_block_size).B && mx_resp_is_scaled && mesh_resp.tag.mx_second_half
+    val mx_a_scale_lane = mesh_resp.tag.mx_block(log2Ceil(DIM) - 1, 0)
+
+    def roundRightNearestEven(value: SInt, shift: UInt): SInt = {
+      val width = 64
+      val cappedShift = Mux(shift >= (width - 1).U, (width - 1).U, shift)
+      val negative = value < 0.S
+      val magnitude = Mux(negative, (-value).asUInt, value.asUInt)
+      val quotient = magnitude >> cappedShift
+      val remainderMask = (1.U(width.W) << cappedShift) - 1.U
+      val remainder = magnitude & remainderMask
+      val halfway = 1.U(width.W) << (cappedShift - 1.U)
+      val roundUp = remainder > halfway || (remainder === halfway && quotient(0))
+      val rounded = quotient + roundUp
+      val result = Mux(negative, -rounded.asSInt, rounded.asSInt)
+      // Mirror the software golden (`mxint8_round_right_shift_nearest_even`): a
+      // right shift of >= 63 annihilates the value rather than rounding to +/-1.
+      Mux(shift >= (width - 1).U, 0.S(64.W), result)
+    }
+
+    def scalePowerOfTwo(value: SInt, shift: SInt): SInt = {
+      val width = 64
+      val maxV = ((BigInt(1) << (width - 1)) - 1).S(width.W) // INT64_MAX
+      val minV = (-(BigInt(1) << (width - 1))).S(width.W)    // INT64_MIN
+      val sh = shift.asUInt
+      // Left (non-negative) shift: saturate to the int64 range exactly like the
+      // software golden (`mxint8_scale_raw_block`), so a large block scale clips
+      // instead of wrapping when `value << shift` exceeds 64 bits. Bound the shift
+      // amount fed to `<<` so the generated shifter stays log2(64) bits wide.
+      val shBounded = Mux(sh >= width.U, (width - 1).U, sh)(log2Ceil(width) - 1, 0)
+      val overflow = value > (maxV >> shBounded) || value < (minV >> shBounded)
+      val left = Mux(overflow, Mux(value < 0.S, minV, maxV),
+        (value << shBounded)(width - 1, 0).asSInt)
+      val right = roundRightNearestEven(value, (-shift).asUInt)
+      Mux(shift >= 0.S, left, right)
+    }
+
+    def saturateToAcc(value: SInt): T = {
+      val max = (BigInt(1) << (accType.getWidth - 1)) - 1
+      val min = -(BigInt(1) << (accType.getWidth - 1))
+      val clipped = Mux(value > max.S(64.W), max.S(64.W),
+        Mux(value < min.S(64.W), min.S(64.W), value))
+      clipped(accType.getWidth - 1, 0).asTypeOf(accType)
+    }
+
+    val a_exp = mx.resp_a.bits.exp(mx_a_scale_lane)
+    val a_invalid = mx.resp_a.bits.invalid(mx_a_scale_lane)
+
+    when (mx_dim16_first_half) {
+      mx_raw_half(output_counter) := VecInit(mesh_resp.data.map(v =>
+        VecInit(v.map(_.asUInt.asSInt.pad(64)))))
+    }
+
+    mx_suppress_acc_write := mx_dim16_first_half
+    mx_acc_wdata := VecInit(mesh_resp.data.zipWithIndex.map { case (col, colId) =>
+      VecInit(col.zipWithIndex.map { case (elem, tileId) =>
+        val lane = colId * tileColumns + tileId
+        val raw_current = elem.asUInt.asSInt.pad(64)
+        val raw_block = Mux(mx_dim16_second_half,
+          mx_raw_half(output_counter)(colId)(tileId) + raw_current,
+          raw_current)
+        val scale_shift = (a_exp +& mx_b_exp(lane)).asSInt - (2 * mx_int_frac_bits).S(mx_scale_exp_bits.W)
+        saturateToAcc(scalePowerOfTwo(raw_block, scale_shift))
+      })
+    })
+
+    when (mx_resp_is_scaled && !mx_dim16_first_half) {
+      assert(mx.resp_a.valid, "MXINT8 output reached BlockScaleUnit before A scale vector was valid")
+      assert(mx_b_valid, "MXINT8 output reached BlockScaleUnit before B scale vector was valid")
+      assert(!a_invalid, "MXINT8 A scale vector contains invalid E8M0 scale")
+      assert(!mx_b_invalid.asUInt.orR, "MXINT8 B scale vector contains invalid E8M0 scale")
+      assert(mx_a_scale_lane < DIM.U, "MXINT8 A scale lane is outside the loaded sidecar row")
+    }
+  }
+
   // Write to normal scratchpad
   for(i <- 0 until sp_banks) {
-    val activated_wdata = VecInit(mesh.io.resp.bits.data.map(v => VecInit(v.map { e =>
+    val activated_wdata = VecInit(mesh_resp.data.map(v => VecInit(v.map { e =>
       val e_clipped = e.clippedToWidthOf(inputType)
       val e_act = MuxCase(e_clipped, Seq(
         (activation === Activation.RELU) -> e_clipped.relu))
@@ -946,9 +1163,11 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   // Write to accumulator
   for (i <- 0 until acc_banks) {
     if (ex_write_to_acc) {
-      io.acc.write(i).valid := start_array_outputting && w_bank === i.U && write_to_acc && !is_garbage_addr && write_this_row
+      io.acc.write(i).valid := start_array_outputting && w_bank === i.U && write_to_acc &&
+        !is_garbage_addr && write_this_row && !mx_suppress_acc_write
       io.acc.write(i).bits.addr := w_row
-      io.acc.write(i).bits.data := VecInit(mesh.io.resp.bits.data.map(v => VecInit(v.map(e => e.withWidthOf(accType)))))
+      io.acc.write(i).bits.data := Mux(mesh_resp.tag.mx_enabled, mx_acc_wdata,
+        VecInit(mesh_resp.data.map(v => VecInit(v.map(e => e.withWidthOf(accType))))))
       io.acc.write(i).bits.acc := w_address.accumulate
       io.acc.write(i).bits.mask := w_mask.flatMap(b => Seq.fill(accType.getWidth / (aligned_to * 8))(b))
     } else {
@@ -967,14 +1186,14 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   //val complete_lock = RegInit(false.B)
 
   //Seah: added for WS accumulator
-  when(mesh.io.resp.fire && mesh.io.resp.bits.tag.rob_id.valid) {
+  when(mesh_resp_valid && mesh_resp.tag.rob_id.valid) {
     output_counter := wrappingAdd(output_counter, 1.U, w_total_output_rows)
-    val last = mesh.io.resp.bits.last
+    val last = mesh_resp.last
 
     when(last) {
       mesh_completed_rob_id_fire := true.B
       io.completed.valid := true.B
-      io.completed.bits := mesh.io.resp.bits.tag.rob_id.bits
+      io.completed.bits := mesh_resp.tag.rob_id.bits
     }
     start_array_outputting :=  !is_garbage_addr
   }

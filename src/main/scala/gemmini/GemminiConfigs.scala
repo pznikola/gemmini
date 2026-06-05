@@ -100,6 +100,12 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
                                                                              tl_ext_mem_base: BigInt = 0,
                                                                              clock_gate: Boolean = false,
 
+                                                                             mx_enabled: Boolean = false,
+                                                                             mx_block_size: Int = 32,
+                                                                             mx_scale_bits: Int = 8,
+                                                                             mx_int_frac_bits: Int = 6,
+                                                                             mx_scale_sp_capacity: GemminiMemCapacity = CapacityInKilobytes(8),
+
                                                                              headerFileName: String = "gemmini_params.h"
                                                        ) {
   require(inputType.getWidth == weightType.getWidth)
@@ -194,6 +200,27 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
   val LOG2_DIM        = log2Up(DIM)
   val LOG2_DIM_COUNT  = log2Up(DIM + 1)
   require(DIM >= 2, "the systolic array must have DIM of at least 2")
+
+  val mx_scale_row_bits = mx_scale_bits * DIM
+  val mx_scale_sp_entries = mx_scale_sp_capacity match {
+    case CapacityInKilobytes(kb) => kb * 1024 * 8 / mx_scale_row_bits
+    case CapacityInMatrices(ms) => ms * DIM
+  }
+  val mx_scale_sp_rows = mx_scale_sp_entries
+  val mx_scale_addr_bits = log2Up(mx_scale_sp_entries max 1)
+  val mx_scale_exp_bits = mx_scale_bits + 1
+
+  require(!mx_enabled || mx_block_size == 32, "MXINT8 v1 supports only OCP MX block size 32")
+  require(!mx_enabled || mx_scale_bits == 8, "MXINT8 v1 supports only E8M0 scale bytes")
+  require(!mx_enabled || mx_int_frac_bits == 6, "MXINT8 payloads use an implicit 2^-6 scale")
+  require(!mx_enabled || inputType.getWidth == 8, "MXINT8 requires 8-bit inputType payloads")
+  require(!mx_enabled || weightType.getWidth == 8, "MXINT8 requires 8-bit weightType payloads")
+  require(!mx_enabled || inputType.isInstanceOf[SInt], "MXINT8 v1 requires signed INT8 input payloads")
+  require(!mx_enabled || weightType.isInstanceOf[SInt], "MXINT8 v1 requires signed INT8 weight payloads")
+  require(!mx_enabled || accType.isInstanceOf[SInt], "MXINT8 v1 requires a signed integer accumulator")
+  require(!mx_enabled || dataflow == Dataflow.WS, "MXINT8 v1 is scoped to weight-stationary Gemmini configs")
+  require(!mx_enabled || (DIM == 16 || DIM == 32), "MXINT8 v1 is staged for DIM=16 and DIM=32 only")
+  require(!mx_enabled || mx_scale_sp_entries > 0, "MX scale SRAM capacity must provide at least one scale row")
 
   //==========================================================================
   // cisc-gemmini miscellaneous constants (some redundant with above)
@@ -362,6 +389,14 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       header ++= s"#define MAX_BLOCK_LEN_ACC 1\n\n"
     }
 
+    header ++= s"#define MX_ENABLED ${if (mx_enabled) 1 else 0}\n"
+    header ++= s"#define MX_BLOCK_SIZE $mx_block_size\n"
+    header ++= s"#define MX_SCALE_BITS $mx_scale_bits\n"
+    header ++= s"#define MX_INT_FRAC_BITS $mx_int_frac_bits\n"
+    header ++= s"#define MX_SCALE_EXP_BITS $mx_scale_exp_bits\n"
+    header ++= s"#define MX_SCALE_SP_ROWS $mx_scale_sp_rows\n"
+    header ++= s"#define MX_SCALE_ROW_BYTES ((DIM * MX_SCALE_BITS) / 8)\n\n"
+
     // Datatype of the systolic array
     val limits = limitsOfDataType(inputType)
     header ++= s"typedef ${c_type(inputType)} elem_t;\n"
@@ -376,6 +411,8 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
     }
     header ++= s"typedef ${c_type(accType)} acc_t;\n"
     header ++= s"typedef ${full_c_type(inputType)} full_t;\n\n"
+    header ++= s"typedef uint8_t mx_scale_t;\n"
+    header ++= s"typedef int16_t mx_exp_t;\n\n"
 
     if (inputType.isInstanceOf[Float]) {
       header ++= "#define ELEM_T_IS_FLOAT\n"

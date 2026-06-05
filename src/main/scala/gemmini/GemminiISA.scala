@@ -38,6 +38,11 @@ object GemminiISA {
   val LOOP_WS_CONFIG_SPAD_AB = 24.U
   val LOOP_WS_CONFIG_SPAD_C = 25.U
 
+  val CONFIG_MXINT8_CMD = 26.U
+  val LOAD_MX_SCALE_A_CMD = 27.U
+  val LOAD_MX_SCALE_B_CMD = 28.U
+  val LOOP_WS_MXINT8 = 29.U
+
   // rs1[2:0] values
   val CONFIG_EX = 0.U
   val CONFIG_LOAD = 1.U
@@ -250,4 +255,3 @@ object GemminiISA {
     val local_addr = local_addr_t.cloneType
   }
 }
-

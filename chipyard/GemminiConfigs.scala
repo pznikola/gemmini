@@ -45,3 +45,19 @@ class GemminiShuttleConfig extends Config(
   new gemmini.DefaultGemminiConfig ++                            // use Gemmini systolic array GEMM accel
   new shuttle.common.WithNShuttleCores ++
   new chipyard.config.AbstractConfig)
+
+// ------------------------------
+// MXINT8 (OCP microscaling int8) Gemmini configs
+// ------------------------------
+
+class GemminiMXINT8DIM32RocketConfig extends Config(
+  new gemmini.GemminiMXINT8DIM32Config ++                        // 32x32 MXINT8 block-scaled Gemmini
+  new freechips.rocketchip.rocket.WithNHugeCores(1) ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new chipyard.config.AbstractConfig)
+
+class GemminiMXINT8DIM16RocketConfig extends Config(
+  new gemmini.GemminiMXINT8DIM16Config ++                        // 16x16 MXINT8 two-phase Gemmini
+  new freechips.rocketchip.rocket.WithNHugeCores(1) ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new chipyard.config.AbstractConfig)

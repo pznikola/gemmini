@@ -208,6 +208,10 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
   val reader = LazyModule(new StreamReader(config, max_in_flight_mem_reqs, dataBits, maxBytes, spad_w, acc_w, aligned_to,
     sp_banks * sp_bank_entries, acc_banks * acc_bank_entries, block_rows, use_tlb_register_filter,
     use_firesim_simulation_counters))
+  val mx_scale_reader = Option.when(mx_enabled)(LazyModule(new StreamReader(config, max_in_flight_mem_reqs, dataBits, maxBytes,
+    mx_scale_row_bits, mx_scale_row_bits, 1,
+    mx_scale_sp_entries, mx_scale_sp_entries, 1, use_tlb_register_filter,
+    use_firesim_simulation_counters)))
   val writer = LazyModule(new StreamWriter(max_in_flight_mem_reqs, dataBits, maxBytes,
     if (acc_read_full_width) acc_w else spad_w, aligned_to, inputType, block_cols, use_tlb_register_filter,
     use_firesim_simulation_counters))
@@ -220,6 +224,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
   // id_node :=* writer.node
 
   xbar_node := TLBuffer() := reader.node // TODO
+  mx_scale_reader.foreach { r => xbar_node := TLBuffer() := r.node }
   xbar_node := TLBuffer() := writer.node
   id_node := TLWidthWidget(config.dma_buswidth/8) := TLBuffer() := xbar_node
 
@@ -259,7 +264,16 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
       }
 
       // TLB ports
-      val tlb = Vec(2 + spad_writer.map(_ => 1).getOrElse(0), new FrontendTLBIO)
+      val tlb = Vec(2 + spad_writer.map(_ => 1).getOrElse(0) + mx_scale_reader.map(_ => 1).getOrElse(0), new FrontendTLBIO)
+
+      val mx = if (mx_enabled) {
+        Some(new Bundle {
+          val read = Flipped(new MXScaleReadMemIO(mx_scale_sp_entries))
+          val write = Decoupled(new MXScaleSRAMWriteReq(mx_scale_sp_entries, DIM, mx_scale_bits))
+        })
+      } else {
+        None
+      }
 
       // Misc. ports
       val busy = Output(Bool())
@@ -404,6 +418,36 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
     reader.module.io.req.bits.status := read_issue_q.io.deq.bits.status
     reader.module.io.req.bits.cmd_id := read_issue_q.io.deq.bits.cmd_id
 
+    mx_scale_reader.foreach { mx_reader =>
+      val mx = io.mx.get
+
+      mx_reader.module.io.req.valid := mx.read.req.valid
+      mx.read.req.ready := mx_reader.module.io.req.ready
+      mx_reader.module.io.req.bits.vaddr := mx.read.req.bits.vaddr
+      mx_reader.module.io.req.bits.spaddr := mx.read.req.bits.laddr
+      mx_reader.module.io.req.bits.len := mx.read.req.bits.cols
+      mx_reader.module.io.req.bits.repeats := 0.U
+      mx_reader.module.io.req.bits.pixel_repeats := 1.U
+      mx_reader.module.io.req.bits.scale := 0.U
+      mx_reader.module.io.req.bits.is_acc := mx.read.req.bits.is_b
+      mx_reader.module.io.req.bits.accumulate := false.B
+      mx_reader.module.io.req.bits.has_acc_bitwidth := false.B
+      mx_reader.module.io.req.bits.block_stride := 1.U
+      mx_reader.module.io.req.bits.status := mx.read.req.bits.status
+      mx_reader.module.io.req.bits.cmd_id := mx.read.req.bits.cmd_id
+
+      mx.write.valid := mx_reader.module.io.resp.valid
+      mx.write.bits.is_b := mx_reader.module.io.resp.bits.is_acc
+      mx.write.bits.addr := mx_reader.module.io.resp.bits.addr
+      mx.write.bits.bytes := mx_reader.module.io.resp.bits.data.asTypeOf(Vec(DIM, UInt(mx_scale_bits.W)))
+      mx.write.bits.mask := mx_reader.module.io.resp.bits.mask.take(DIM)
+      mx_reader.module.io.resp.ready := mx.write.ready
+
+      mx.read.resp.valid := mx_reader.module.io.resp.fire && mx_reader.module.io.resp.bits.last
+      mx.read.resp.bits.cmd_id := mx_reader.module.io.resp.bits.cmd_id
+      mx.read.resp.bits.bytesRead := mx_reader.module.io.resp.bits.bytes_read
+    }
+
     val (mvin_scale_in, mvin_scale_out) = VectorScalarMultiplier(
       config.mvin_scale_args,
       config.inputType, config.meshColumns * config.tileColumns, chiselTypeOf(reader.module.io.resp.bits),
@@ -480,6 +524,10 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
 
     io.tlb(0) <> writer.module.io.tlb
     io.tlb(1) <> reader.module.io.tlb
+    mx_scale_reader.foreach { mx_reader =>
+      io.tlb(2 + spad_writer.map(_ => 1).getOrElse(0)) <> mx_reader.module.io.tlb
+      mx_reader.module.io.flush := io.flush
+    }
     spad_writer match {
       case Some(sw) => {
         io.tlb(2) <> sw.module.io.tlb
@@ -492,6 +540,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
     reader.module.io.flush := io.flush
 
     io.busy := writer.module.io.busy || spad_writer.map(_.module.io.busy).getOrElse(false.B) || reader.module.io.busy ||
+      mx_scale_reader.map(_.module.io.busy).getOrElse(false.B) ||
       write_issue_q.io.deq.valid || write_norm_q.io.deq.valid || write_scale_q.io.deq.valid || write_dispatch_q.valid
 
     val spad_mems = {
@@ -884,6 +933,10 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
     // Counter connection
     io.counter := DontCare
     io.counter.collect(reader.module.io.counter)
+    // The MX scale reader is a StreamReader and shares the main reader's
+    // CounterEvent IDs, so collecting it would double-connect those ports. Tie
+    // it off here; dedicated MX metadata counters are added in a later phase.
+    mx_scale_reader.foreach(_.module.io.counter := DontCare)
     io.counter.collect(writer.module.io.counter)
     spad_writer.foreach(_.module.io.counter := DontCare)
 //    io.counter.collect(spad_writer.module.io.counter)

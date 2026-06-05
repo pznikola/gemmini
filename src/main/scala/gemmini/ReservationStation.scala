@@ -87,6 +87,10 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     val q = q_t.cloneType
 
     val is_config = Bool()
+    // MXINT8: scale-vector mvins are real DMA loads (not stateless configs), but
+    // they target the sidecar MXScaleSRAM, not the scratchpad, so they carry no
+    // address range. This marker lets a compute depend on in-flight scale loads.
+    val is_mx_scale = Bool()
 
     val opa = UDValid(new OpT)
     val opa_is_dst = Bool()
@@ -191,12 +195,14 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     val cmd = io.alloc.bits.cmd
     val funct = cmd.inst.funct
     val funct_is_compute = funct === COMPUTE_AND_STAY_CMD || funct === COMPUTE_AND_FLIP_CMD
+    val funct_is_mx_scale_load = funct === LOAD_MX_SCALE_A_CMD || funct === LOAD_MX_SCALE_B_CMD
     val config_cmd_type = cmd.rs1(1,0) // TODO magic numbers
 
     new_entry.issued := false.B
     new_entry.cmd := io.alloc.bits
 
-    new_entry.is_config := funct === CONFIG_CMD
+    new_entry.is_config := funct === CONFIG_CMD || funct_is_mx_scale_load
+    new_entry.is_mx_scale := funct_is_mx_scale_load
 
     val op1 = Wire(UDValid(new OpT))
     op1.valid := false.B
@@ -310,7 +316,8 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
       dst.bits.wraps_around := dst.bits.start.add_with_overflow(total_mvin_rows)._2
     }
 
-    val is_load = funct === LOAD_CMD || funct === LOAD2_CMD || funct === LOAD3_CMD || (funct === CONFIG_CMD && config_cmd_type === CONFIG_LOAD)
+    val is_load = funct === LOAD_CMD || funct === LOAD2_CMD || funct === LOAD3_CMD || funct_is_mx_scale_load ||
+      (funct === CONFIG_CMD && config_cmd_type === CONFIG_LOAD)
     val is_ex = funct === PRELOAD_CMD || funct_is_compute || (funct === CONFIG_CMD && config_cmd_type === CONFIG_EX)
     val is_store = funct === STORE_CMD || funct === STORE_SPAD_CMD || (funct === CONFIG_CMD && (config_cmd_type === CONFIG_STORE || config_cmd_type === CONFIG_NORM))
     val is_norm = funct === CONFIG_CMD && config_cmd_type === CONFIG_NORM // normalization commands are a subset of store commands, so they still go in the store queue
@@ -337,9 +344,14 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
         (new_entry.opa.bits.overlaps(e.bits.opb.bits) && e.bits.opb.valid))}) // war if st_spad
     }.elsewhen (is_ex) {
       // raw/waw (after ld) | war/waw/raw (after st)
-      new_entry.deps_ld := VecInit(entries_ld.map { e => e.valid && e.bits.opa.valid && not_config && (
-        new_entry.opa.bits.overlaps(e.bits.opa.bits) || // waw if preload, raw if compute
-        new_entry.opb.bits.overlaps(e.bits.opa.bits))}) // raw
+      // A compute/preload additionally depends on every in-flight MXINT8 scale-vector
+      // mvin: scales live in the sidecar MXScaleSRAM (no address range to overlap), so
+      // without this the matmul could read stale scales before the scale DMA completes.
+      new_entry.deps_ld := VecInit(entries_ld.map { e => e.valid && (
+        e.bits.is_mx_scale ||
+        (e.bits.opa.valid && not_config && (
+          new_entry.opa.bits.overlaps(e.bits.opa.bits) || // waw if preload, raw if compute
+          new_entry.opb.bits.overlaps(e.bits.opa.bits))))}) // raw
 
       new_entry.deps_ex := VecInit(entries_ex.map { e => e.valid && !e.bits.issued }) // same q
 
@@ -380,7 +392,12 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
 
     new_entry.allocated_at := instructions_allocated
 
-    new_entry.complete_on_issue := new_entry.is_config && new_entry.q =/= exqu
+    // Scale-vector mvins are is_config (so they create no address dependencies), but
+    // unlike stateless configs they move data via DMA and must complete on the
+    // controller's real completion signal, not on issue. Otherwise the entry would be
+    // freed before MXScaleSRAM is written, and the later DMA completion would strike a
+    // freed/reused load slot (firing the completion-path valid assert).
+    new_entry.complete_on_issue := new_entry.is_config && new_entry.q =/= exqu && !new_entry.is_mx_scale
 
     Seq(
       (ldqu, entries_ld, new_allocs_oh_ld, reservation_station_entries_ld),

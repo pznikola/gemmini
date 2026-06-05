@@ -171,7 +171,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
   // TLB
   implicit val edge = outer.spad.id_node.edges.out.head
-  val tlb = Module(new FrontendTLB(if (outer.config.use_tl_ext_mem) 3 else 2,
+  val tlb = Module(new FrontendTLB((if (outer.config.use_tl_ext_mem) 3 else 2) + (if (outer.config.mx_enabled) 1 else 0),
     tlb_size, dma_maxbytes, use_tlb_register_filter, use_firesim_simulation_counters, use_shared_tlb))
   (tlb.io.clients zip outer.spad.module.io.tlb).foreach(t => t._1 <> t._2)
 
@@ -270,6 +270,11 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   unrolled_cmd.ready := false.B
   counters.io.event_io.connectEventSignal(CounterEvent.LOOP_MATMUL_ACTIVE_CYCLES, loop_matmul_unroller_busy)
 
+  val mx_runtime_enabled = RegInit(false.B)
+  val mx_scale_stride_a = RegInit(0.U(coreMaxAddrBits.W))
+  val mx_scale_stride_b = RegInit(0.U(coreMaxAddrBits.W))
+  val mx_config_pulse = WireInit(false.B)
+
   // Wire up controllers to ROB
   reservation_station.io.alloc.valid := false.B
   reservation_station.io.alloc.bits := unrolled_cmd.bits
@@ -299,8 +304,10 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   // Controllers
   //=========================================================================
   val load_controller = withClock (gated_clock) { Module(new LoadController(outer.config, coreMaxAddrBits, local_addr_t)) }
+  val mx_scale_load_controller = withClock (gated_clock) { Module(new MXScaleLoadController(outer.config, coreMaxAddrBits)) }
   val store_controller = withClock (gated_clock) { Module(new StoreController(outer.config, coreMaxAddrBits, local_addr_t)) }
   val ex_controller = withClock (gated_clock) { Module(new ExecuteController(xLen, tagWidth, outer.config)) }
+  val mx_scale_sram = if (mx_enabled) Some(withClock (gated_clock) { Module(new MXScaleSRAM(outer.config)) }) else None
 
   counters.io.event_io.collect(load_controller.io.counter)
   counters.io.event_io.collect(store_controller.io.counter)
@@ -343,10 +350,19 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   }
   */
 
-  load_controller.io.cmd.valid := reservation_station.io.issue.ld.valid
-  reservation_station.io.issue.ld.ready := load_controller.io.cmd.ready
+  val ld_issue_is_mx_scale = mx_enabled.B && reservation_station.io.issue.ld.valid &&
+    (reservation_station.io.issue.ld.cmd.cmd.inst.funct === LOAD_MX_SCALE_A_CMD ||
+      reservation_station.io.issue.ld.cmd.cmd.inst.funct === LOAD_MX_SCALE_B_CMD)
+
+  load_controller.io.cmd.valid := reservation_station.io.issue.ld.valid && !ld_issue_is_mx_scale
+  mx_scale_load_controller.io.cmd.valid := reservation_station.io.issue.ld.valid && ld_issue_is_mx_scale
+  reservation_station.io.issue.ld.ready := Mux(ld_issue_is_mx_scale, mx_scale_load_controller.io.cmd.ready, load_controller.io.cmd.ready)
   load_controller.io.cmd.bits := reservation_station.io.issue.ld.cmd
   load_controller.io.cmd.bits.rob_id.push(reservation_station.io.issue.ld.rob_id)
+  mx_scale_load_controller.io.cmd.bits := reservation_station.io.issue.ld.cmd
+  mx_scale_load_controller.io.cmd.bits.rob_id.push(reservation_station.io.issue.ld.rob_id)
+  mx_scale_load_controller.io.stride_a := mx_scale_stride_a
+  mx_scale_load_controller.io.stride_b := mx_scale_stride_b
 
   store_controller.io.cmd.valid := reservation_station.io.issue.st.valid
   reservation_station.io.issue.st.ready := store_controller.io.cmd.ready
@@ -361,6 +377,24 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   // Wire up scratchpad to controllers
   spad.module.io.dma.read <> load_controller.io.dma
   spad.module.io.dma.write <> store_controller.io.dma
+  if (mx_enabled) {
+    val mx = spad.module.io.mx.get
+    mx.read <> mx_scale_load_controller.io.dma
+    mx.write <> mx_scale_sram.get.io.write
+
+    val ex_mx = ex_controller.io.mx.get
+    val scale_sram = mx_scale_sram.get
+    ex_mx.enable := mx_runtime_enabled
+    ex_mx.reset := mx_config_pulse
+    scale_sram.io.read_a <> ex_mx.read_a
+    scale_sram.io.read_b <> ex_mx.read_b
+    ex_mx.resp_a := scale_sram.io.resp_a
+    ex_mx.resp_b := scale_sram.io.resp_b
+  } else {
+    mx_scale_load_controller.io.dma.req.ready := false.B
+    mx_scale_load_controller.io.dma.resp.valid := false.B
+    mx_scale_load_controller.io.dma.resp.bits := DontCare
+  }
   ex_controller.io.srams.read <> spad.module.io.srams.read
   ex_controller.io.srams.write <> spad.module.io.srams.write
   spad.module.io.acc.read_req <> ex_controller.io.acc.read_req
@@ -422,40 +456,46 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
   //-------------------------------------------------------------------------
   // risc
-  val reservation_station_completed_arb = Module(new Arbiter(UInt(log2Up(reservation_station_entries).W), 3))
+  val reservation_station_completed_arb = Module(new Arbiter(UInt(log2Up(reservation_station_entries).W), 4))
 
   reservation_station_completed_arb.io.in(0).valid := ex_controller.io.completed.valid
   reservation_station_completed_arb.io.in(0).bits := ex_controller.io.completed.bits
 
   reservation_station_completed_arb.io.in(1) <> load_controller.io.completed
   reservation_station_completed_arb.io.in(2) <> store_controller.io.completed
+  reservation_station_completed_arb.io.in(3) <> mx_scale_load_controller.io.completed
 
   // mux with cisc frontend arbiter
   reservation_station_completed_arb.io.in(0).valid := ex_controller.io.completed.valid // && !is_cisc_mode
   reservation_station_completed_arb.io.in(1).valid := load_controller.io.completed.valid // && !is_cisc_mode
   reservation_station_completed_arb.io.in(2).valid := store_controller.io.completed.valid // && !is_cisc_mode
+  reservation_station_completed_arb.io.in(3).valid := mx_scale_load_controller.io.completed.valid // && !is_cisc_mode
 
   reservation_station.io.completed.valid := reservation_station_completed_arb.io.out.valid
   reservation_station.io.completed.bits := reservation_station_completed_arb.io.out.bits
   reservation_station_completed_arb.io.out.ready := true.B
 
   // Wire up global RoCC signals
-  io.busy := raw_cmd.valid || loop_conv_unroller_busy || loop_matmul_unroller_busy || reservation_station.io.busy || spad.module.io.busy || unrolled_cmd.valid || loop_cmd.valid || conv_cmd.valid
+  io.busy := raw_cmd.valid || loop_conv_unroller_busy || loop_matmul_unroller_busy ||
+    reservation_station.io.busy || spad.module.io.busy || mx_scale_load_controller.io.busy ||
+    unrolled_cmd.valid || loop_cmd.valid || conv_cmd.valid
 
   io.interrupt := tlb.io.exp.map(_.interrupt).reduce(_ || _)
 
   // assert(!io.interrupt, "Interrupt handlers have not been written yet")
 
   // Cycle counters
-  val incr_ld_cycles = load_controller.io.busy && !store_controller.io.busy && !ex_controller.io.busy
-  val incr_st_cycles = !load_controller.io.busy && store_controller.io.busy && !ex_controller.io.busy
-  val incr_ex_cycles = !load_controller.io.busy && !store_controller.io.busy && ex_controller.io.busy
+  val ld_busy = load_controller.io.busy || mx_scale_load_controller.io.busy
 
-  val incr_ld_st_cycles = load_controller.io.busy && store_controller.io.busy && !ex_controller.io.busy
-  val incr_ld_ex_cycles = load_controller.io.busy && !store_controller.io.busy && ex_controller.io.busy
-  val incr_st_ex_cycles = !load_controller.io.busy && store_controller.io.busy && ex_controller.io.busy
+  val incr_ld_cycles = ld_busy && !store_controller.io.busy && !ex_controller.io.busy
+  val incr_st_cycles = !ld_busy && store_controller.io.busy && !ex_controller.io.busy
+  val incr_ex_cycles = !ld_busy && !store_controller.io.busy && ex_controller.io.busy
 
-  val incr_ld_st_ex_cycles = load_controller.io.busy && store_controller.io.busy && ex_controller.io.busy
+  val incr_ld_st_cycles = ld_busy && store_controller.io.busy && !ex_controller.io.busy
+  val incr_ld_ex_cycles = ld_busy && !store_controller.io.busy && ex_controller.io.busy
+  val incr_st_ex_cycles = !ld_busy && store_controller.io.busy && ex_controller.io.busy
+
+  val incr_ld_st_ex_cycles = ld_busy && store_controller.io.busy && ex_controller.io.busy
 
   counters.io.event_io.connectEventSignal(CounterEvent.MAIN_LD_CYCLES, incr_ld_cycles)
   counters.io.event_io.connectEventSignal(CounterEvent.MAIN_ST_CYCLES, incr_st_cycles)
@@ -477,6 +517,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     val is_flush = risc_funct === FLUSH_CMD
     val is_counter_op = risc_funct === COUNTER_OP
     val is_clock_gate_en = risc_funct === CLKGATE_EN
+    val is_mx_config = mx_enabled.B && risc_funct === CONFIG_MXINT8_CMD
 
     /*
     val is_load = (funct === LOAD_CMD) || (funct === CONFIG_CMD && config_cmd_type === CONFIG_LOAD)
@@ -501,6 +542,25 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     }
 
     .elsewhen (is_clock_gate_en) {
+      unrolled_cmd.ready := true.B
+    }
+
+    .elsewhen (is_mx_config) {
+      val enable = unrolled_cmd.bits.cmd.rs1(0)
+      val set_stride = unrolled_cmd.bits.cmd.rs1(1)
+      val stride_is_b = unrolled_cmd.bits.cmd.rs1(2)
+      val reset_mx = unrolled_cmd.bits.cmd.rs1(3)
+
+      mx_runtime_enabled := enable
+      mx_config_pulse := enable && reset_mx
+      when (set_stride) {
+        when (stride_is_b) {
+          mx_scale_stride_b := unrolled_cmd.bits.cmd.rs2
+        } .otherwise {
+          mx_scale_stride_a := unrolled_cmd.bits.cmd.rs2
+        }
+      }
+
       unrolled_cmd.ready := true.B
     }
 

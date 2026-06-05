@@ -241,6 +241,24 @@ object GemminiConfigs {
     meshRows=32, meshColumns=32
   )
 
+  val mxint8DIM32Config = largeChipConfig.copy(
+    mx_enabled = true,
+    mx_block_size = 32,
+    mx_scale_bits = 8,
+    mx_int_frac_bits = 6,
+    mx_scale_sp_capacity = CapacityInKilobytes(8),
+    headerFileName = "gemmini_params_mxint8_dim32.h"
+  )
+
+  val mxint8DIM16Config = chipConfig.copy(
+    mx_enabled = true,
+    mx_block_size = 32,
+    mx_scale_bits = 8,
+    mx_int_frac_bits = 6,
+    mx_scale_sp_capacity = CapacityInKilobytes(8),
+    headerFileName = "gemmini_params_mxint8_dim16.h"
+  )
+
   val leanConfig = defaultConfig.copy(dataflow=Dataflow.WS, max_in_flight_mem_reqs = 64, acc_read_full_width = false, ex_read_from_acc = false, ex_write_to_spad = false, hardcode_d_to_garbage_addr = true)
 
   val leanPrintfConfig = defaultConfig.copy(dataflow=Dataflow.WS, max_in_flight_mem_reqs = 64, acc_read_full_width = false, ex_read_from_acc = false, ex_write_to_spad = false, hardcode_d_to_garbage_addr = true, use_firesim_simulation_counters=true)
@@ -281,6 +299,30 @@ class LeanGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
 
 class LeanGemminiPrintfConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
   gemminiConfig: GemminiArrayConfig[T,U,V] = GemminiConfigs.leanPrintfConfig
+) extends Config((site, here, up) => {
+  case BuildRoCC => up(BuildRoCC) ++ Seq(
+    (p: Parameters) => {
+      implicit val q = p
+      val gemmini = LazyModule(new Gemmini(gemminiConfig))
+      gemmini
+    }
+  )
+})
+
+class GemminiMXINT8DIM32Config[T <: Data : Arithmetic, U <: Data, V <: Data](
+  gemminiConfig: GemminiArrayConfig[T,U,V] = GemminiConfigs.mxint8DIM32Config
+) extends Config((site, here, up) => {
+  case BuildRoCC => up(BuildRoCC) ++ Seq(
+    (p: Parameters) => {
+      implicit val q = p
+      val gemmini = LazyModule(new Gemmini(gemminiConfig))
+      gemmini
+    }
+  )
+})
+
+class GemminiMXINT8DIM16Config[T <: Data : Arithmetic, U <: Data, V <: Data](
+  gemminiConfig: GemminiArrayConfig[T,U,V] = GemminiConfigs.mxint8DIM16Config
 ) extends Config((site, here, up) => {
   case BuildRoCC => up(BuildRoCC) ++ Seq(
     (p: Parameters) => {
