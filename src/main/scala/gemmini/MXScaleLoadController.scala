@@ -72,8 +72,18 @@ class MXScaleLoadController[T <: Data, U <: Data, V <: Data](config: GemminiArra
   cmd_tracker.io.request_returned.bits.bytes_read := io.dma.resp.bits.bytesRead
   cmd_tracker.io.cmd_completed.ready := io.completed.ready
 
+  // `cmd_id` only reflects the allocated slot one cycle after `alloc.fire`, but the
+  // first row request of a command is issued in the *same* cycle as the allocation
+  // (both fire in `waiting_for_command`). Using the stale register for that first
+  // request misattributes the DMA response to the wrong command-tracker slot. Drive
+  // the first request with the freshly-allocated id combinationally; later rows
+  // (in `waiting_for_dma_req_ready`/`sending_rows`) use the registered value, which
+  // by then equals the same id. With `nCmds == 1` (e.g. DIM=32) the id is always 0
+  // so this is inert; it only matters once `nCmds > 1` (DIM=16), where the stale id
+  // attributed B's scale-load bytes to A's slot and tripped the `bytes_left` assert.
   val cmd_id = RegEnable(cmd_tracker.io.alloc.bits.cmd_id, cmd_tracker.io.alloc.fire())
-  io.dma.req.bits.cmd_id := cmd_id
+  io.dma.req.bits.cmd_id := Mux(control_state === waiting_for_command,
+    cmd_tracker.io.alloc.bits.cmd_id, cmd_id)
 
   io.completed.valid := cmd_tracker.io.cmd_completed.valid
   io.completed.bits := cmd_tracker.io.cmd_completed.bits.tag.rob_id

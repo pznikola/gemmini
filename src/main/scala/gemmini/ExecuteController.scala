@@ -741,6 +741,28 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       "MXINT8 execute path v1 supports untransposed WS GEMM only")
   }
 
+  // When the physical array is narrower than the logical MX block (DIM=16), one
+  // logical 32-element K block spans exactly two physical K phases. The lane
+  // counter advances by `block_size` (=DIM=16) per compute, so the logical block
+  // (`mx_k_lane_counter >> log2(mx_block_size)`) advances only every 32 lanes
+  // (two computes), and `mx_second_half` (`mx_k_lane_counter` bit log2(32)-1)
+  // strictly alternates first/second half. The two-phase BlockScaleUnit only
+  // buffers a single half (`mx_raw_half`), so this exactly-two-phases invariant
+  // is load-bearing.
+  if (mx_enabled && DIM < mx_block_size) {
+    require(mx_block_size == 2 * block_size,
+      "MXINT8 DIM<block two-phase path assumes exactly two physical K phases per MX block")
+    val mx_phase_toggle = RegInit(false.B)
+    when (mx_reset) {
+      mx_phase_toggle := false.B
+    } .elsewhen (control_state === compute && about_to_fire_all_rows &&
+      (perform_single_mul || perform_mul_pre) && mx_compute_active) {
+      assert(mx_second_half === mx_phase_toggle,
+        "MXINT8 DIM<32: physical K phases must alternate first/second half (32-lane K block)")
+      mx_phase_toggle := !mx_phase_toggle
+    }
+  }
+
   // Computing logic
   val computing = performing_mul_pre || performing_single_mul || performing_single_preload
 
@@ -862,40 +884,13 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   mesh_cntl_signals_q.io.enq.bits.mx_block := mx_logical_block(mx_scale_addr_bits - 1, 0)
   mesh_cntl_signals_q.io.enq.bits.mx_second_half := mx_second_half
 
-  val mx_b_exp = if (mx_enabled) Reg(Vec(DIM, SInt(mx_scale_exp_bits.W))) else Wire(Vec(DIM, SInt(mx_scale_exp_bits.W)))
-  val mx_b_invalid = if (mx_enabled) Reg(Vec(DIM, Bool())) else Wire(Vec(DIM, Bool()))
-  val mx_b_valid = if (mx_enabled) RegInit(false.B) else false.B
-
-  if (!mx_enabled) {
-    // These held B-scale wires are only read inside `if (mx_enabled)` blocks, so
-    // when MX is disabled they are dead. Drive them so elaboration's
-    // full-initialization check does not see undriven sinks (firtool rejects them).
-    mx_b_exp := DontCare
-    mx_b_invalid := DontCare
-  }
-
-  if (mx_enabled) {
-    val mx = io.mx.get
-    val b_scale_base = (mx_scale_sp_entries / 2).U(mx_scale_addr_bits.W)
-    val b_read_start = mesh_cntl_signals_q.io.enq.fire &&
-      mesh_cntl_signals_q.io.enq.bits.first &&
-      mesh_cntl_signals_q.io.enq.bits.mx_enabled
-
-    mx.read_b.valid := b_read_start
-    mx.read_b.bits.addr := b_scale_base + mesh_cntl_signals_q.io.enq.bits.mx_block
-
-    when (mx.read_b.fire) {
-      mx_b_valid := false.B
-    }
-    when (mx.resp_b.valid) {
-      mx_b_exp := mx.resp_b.bits.exp
-      mx_b_invalid := mx.resp_b.bits.invalid
-      mx_b_valid := true.B
-      assert(!mx.resp_b.bits.invalid.asUInt.orR, "MXINT8 B scale vector contains invalid E8M0 scale")
-    }
-
-    assert(!mx.read_b.valid || mx.read_b.ready, "MXScaleSRAM B read port must accept scale vector reads")
-  }
+  // The B scale vector is read at *output* time (addressed by the output's own
+  // `tag.mx_block`), mirroring the A-scale read below, rather than latched once at
+  // mesh-feed time. A feed-time latch is unsafe across logical K blocks: with the deep
+  // weight-stationary output pipeline (worst at DIM=16, where one logical block spans
+  // two physical phases) the next block's feed would overwrite the single latch while
+  // the current block's outputs are still draining, so the current block's tail rows
+  // would be scaled by the next block's B exponents. See the BlockScaleUnit.
 
   val readData = VecInit(io.srams.read.map(_.resp.bits.data))
   val accReadData = if (ex_read_from_acc) VecInit(io.acc.read_resp.map(_.bits.data.asUInt)) else readData
@@ -1033,6 +1028,17 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     mx.read_a.valid := mesh.io.resp.valid && mesh.io.resp.bits.tag.mx_enabled
     mx.read_a.bits.addr := mx_a_read_row
     assert(!mx.read_a.valid || mx.read_a.ready, "MXScaleSRAM A read port must accept scale vector reads")
+
+    // The B-scale SRAM read is issued in the same *undelayed* mesh-output domain,
+    // addressed by the output's own logical K block (`tag.mx_block`), so its 1-cycle
+    // latency aligns with the delayed output and each block's rows are scaled by their
+    // own B exponents even when several blocks are pipelined together (DIM=16). Unlike
+    // A (indexed by output row), B is indexed by the K block, so no row counter is
+    // needed. The B exponent vector spans the N output columns.
+    val b_scale_base = (mx_scale_sp_entries / 2).U(mx_scale_addr_bits.W)
+    mx.read_b.valid := mesh.io.resp.valid && mesh.io.resp.bits.tag.mx_enabled
+    mx.read_b.bits.addr := b_scale_base + mesh.io.resp.bits.tag.mx_block
+    assert(!mx.read_b.valid || mx.read_b.ready, "MXScaleSRAM B read port must accept scale vector reads")
   }
 
   val w_total_output_rows = mesh_resp.total_rows
@@ -1109,8 +1115,22 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
     val a_exp = mx.resp_a.bits.exp(mx_a_scale_lane)
     val a_invalid = mx.resp_a.bits.invalid(mx_a_scale_lane)
+    // B scale read at output time (issued in the undelayed domain above, addressed by
+    // this output's K block); the response aligns with the delayed output and is
+    // indexed per N output column. `b_exp(lane)` replaces the old feed-time latch.
+    val b_exp = mx.resp_b.bits.exp
+    val mx_b_scale_invalid = mx.resp_b.bits.invalid
+    val mx_b_scale_valid = mx.resp_b.valid
 
-    when (mx_dim16_first_half) {
+    // Only buffer the first half on a real, committed output row, mirroring the
+    // accumulator-write guards below. In weight-stationary mode the mesh also
+    // emits non-output cycles tagged mx_enabled (the multiply's garbage-addr
+    // output and pipeline bubbles); these have `rob_id.valid=false`, so they do
+    // not advance `output_counter` or raise `start_array_outputting`. Without
+    // this guard they re-store `mx_raw_half(0)` with zero between the two phases,
+    // so the second half reads 0 and only one 16-wide half reaches the
+    // accumulator (output = one half instead of the summed block).
+    when (mx_dim16_first_half && start_array_outputting && write_this_row) {
       mx_raw_half(output_counter) := VecInit(mesh_resp.data.map(v =>
         VecInit(v.map(_.asUInt.asSInt.pad(64)))))
     }
@@ -1123,16 +1143,18 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
         val raw_block = Mux(mx_dim16_second_half,
           mx_raw_half(output_counter)(colId)(tileId) + raw_current,
           raw_current)
-        val scale_shift = (a_exp +& mx_b_exp(lane)).asSInt - (2 * mx_int_frac_bits).S(mx_scale_exp_bits.W)
+        val scale_shift = (a_exp +& b_exp(lane)).asSInt - (2 * mx_int_frac_bits).S(mx_scale_exp_bits.W)
         saturateToAcc(scalePowerOfTwo(raw_block, scale_shift))
       })
     })
 
-    when (mx_resp_is_scaled && !mx_dim16_first_half) {
+    // Validate the scales only on real, committed output rows (not the WS bubble /
+    // garbage-address cycles, which carry stale scale lanes).
+    when (mx_resp_is_scaled && !mx_dim16_first_half && start_array_outputting && write_this_row) {
       assert(mx.resp_a.valid, "MXINT8 output reached BlockScaleUnit before A scale vector was valid")
-      assert(mx_b_valid, "MXINT8 output reached BlockScaleUnit before B scale vector was valid")
+      assert(mx_b_scale_valid, "MXINT8 output reached BlockScaleUnit before B scale vector was valid")
       assert(!a_invalid, "MXINT8 A scale vector contains invalid E8M0 scale")
-      assert(!mx_b_invalid.asUInt.orR, "MXINT8 B scale vector contains invalid E8M0 scale")
+      assert(!mx_b_scale_invalid.asUInt.orR, "MXINT8 B scale vector contains invalid E8M0 scale")
       assert(mx_a_scale_lane < DIM.U, "MXINT8 A scale lane is outside the loaded sidecar row")
     }
   }
