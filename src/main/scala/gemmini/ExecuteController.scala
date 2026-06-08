@@ -1010,6 +1010,35 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
   mesh_resp := mesh.io.resp.bits
   mesh_resp_valid := mesh.io.resp.valid
+
+  // Output-domain re-derivation of (logical K block, second-half) for the DIM<block
+  // two-phase path. The feed-time tag fields (`tag.mx_block`/`tag.mx_second_half`, sampled
+  // from the live `mx_k_lane_counter` at enqueue) drift one physical phase relative to the
+  // output at a logical-block boundary: under WS preload/compute fusion plus the mesh's +2
+  // tag latency, the counter sample and the output association are taken at different points
+  // (the C address rides the tag FIFO correctly, so the accumulate bit is right; these
+  // counter samples do not). Recover the truth from the strict FIFO drain order instead --
+  // WS outputs leave the array one real matmul per K phase, in issue order -- with a phase
+  // counter that ticks once per drained MX matmul: block = phase >> 1, second_half = phase(0).
+  // Mirror the `mx_a_read_row` (undelayed) / `output_counter` (delayed) split so the
+  // undelayed value addresses the B-scale SRAM read and the delayed value drives the scaling,
+  // staying aligned across the 1-cycle `mx_delay_outputs` delay. DIM=32 (one phase per block,
+  // tag already correct) keeps the tag fields unchanged.
+  val (mx_out_block_u, mx_out_block, mx_out_second_half) =
+    if (mx_enabled && DIM < mx_block_size) {
+      val mx_phase = RegInit(0.U((mx_scale_addr_bits + 1).W))
+      when (mx_reset) {
+        mx_phase := 0.U
+      } .elsewhen (mesh.io.resp.valid && mesh.io.resp.bits.last &&
+          mesh.io.resp.bits.tag.rob_id.valid && mesh.io.resp.bits.tag.mx_enabled) {
+        mx_phase := mx_phase + 1.U
+      }
+      val mx_phase_d = RegNext(mx_phase, 0.U)
+      ((mx_phase >> 1).asUInt, (mx_phase_d >> 1).asUInt, mx_phase_d(0))
+    } else {
+      (mesh.io.resp.bits.tag.mx_block, mesh_resp.tag.mx_block, mesh_resp.tag.mx_second_half)
+    }
+
   if (mx_enabled) {
     mesh_resp := Mux(mx_delay_outputs, mx_mesh_resp_bits, mesh.io.resp.bits)
     mesh_resp_valid := Mux(mx_delay_outputs, mx_mesh_resp_valid, mesh.io.resp.valid)
@@ -1030,14 +1059,14 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     assert(!mx.read_a.valid || mx.read_a.ready, "MXScaleSRAM A read port must accept scale vector reads")
 
     // The B-scale SRAM read is issued in the same *undelayed* mesh-output domain,
-    // addressed by the output's own logical K block (`tag.mx_block`), so its 1-cycle
-    // latency aligns with the delayed output and each block's rows are scaled by their
-    // own B exponents even when several blocks are pipelined together (DIM=16). Unlike
-    // A (indexed by output row), B is indexed by the K block, so no row counter is
-    // needed. The B exponent vector spans the N output columns.
+    // addressed by the output's own logical K block (`mx_out_block_u`, re-derived from the
+    // output-domain phase counter), so its 1-cycle latency aligns with the delayed output
+    // and each block's rows are scaled by their own B exponents even when several blocks are
+    // pipelined together (DIM=16). Unlike A (indexed by output row), B is indexed by the K
+    // block, so no row counter is needed. The B exponent vector spans the N output columns.
     val b_scale_base = (mx_scale_sp_entries / 2).U(mx_scale_addr_bits.W)
     mx.read_b.valid := mesh.io.resp.valid && mesh.io.resp.bits.tag.mx_enabled
-    mx.read_b.bits.addr := b_scale_base + mesh.io.resp.bits.tag.mx_block
+    mx.read_b.bits.addr := b_scale_base + mx_out_block_u
     assert(!mx.read_b.valid || mx.read_b.ready, "MXScaleSRAM B read port must accept scale vector reads")
   }
 
@@ -1067,9 +1096,9 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     val mx = io.mx.get
     val mx_raw_half = Reg(Vec(block_size, Vec(meshColumns, Vec(tileColumns, SInt(64.W)))))
     val mx_resp_is_scaled = mesh_resp_valid && mesh_resp.tag.mx_enabled
-    val mx_dim16_first_half = (DIM < mx_block_size).B && mx_resp_is_scaled && !mesh_resp.tag.mx_second_half
-    val mx_dim16_second_half = (DIM < mx_block_size).B && mx_resp_is_scaled && mesh_resp.tag.mx_second_half
-    val mx_a_scale_lane = mesh_resp.tag.mx_block(log2Ceil(DIM) - 1, 0)
+    val mx_dim16_first_half = (DIM < mx_block_size).B && mx_resp_is_scaled && !mx_out_second_half
+    val mx_dim16_second_half = (DIM < mx_block_size).B && mx_resp_is_scaled && mx_out_second_half
+    val mx_a_scale_lane = mx_out_block(log2Ceil(DIM) - 1, 0)
 
     def roundRightNearestEven(value: SInt, shift: UInt): SInt = {
       val width = 64
