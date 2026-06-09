@@ -47,8 +47,8 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
         val reset = Input(Bool())
         val read_a = Decoupled(new MXScaleSRAMReadReq(mx_scale_sp_entries))
         val read_b = Decoupled(new MXScaleSRAMReadReq(mx_scale_sp_entries))
-        val resp_a = Flipped(Valid(new MXScaleSRAMReadResp(DIM, mx_scale_bits, mx_scale_exp_bits)))
-        val resp_b = Flipped(Valid(new MXScaleSRAMReadResp(DIM, mx_scale_bits, mx_scale_exp_bits)))
+        val resp_a = Flipped(Valid(new MXScaleSRAMReadResp(DIM, mx_scale_exp_bits)))
+        val resp_b = Flipped(Valid(new MXScaleSRAMReadResp(DIM, mx_scale_exp_bits)))
       })
     } else {
       None
@@ -1051,10 +1051,16 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     // row i the A scale of row i-1. Track the undelayed row index with a dedicated
     // counter that mirrors `output_counter`'s increment one cycle earlier.
     val mx_a_read_row = RegInit(0.U(log2Up(block_size).W))
-    when (mesh.io.resp.valid && mesh.io.resp.bits.tag.rob_id.valid) {
+    when (mx_reset) {
+      mx_a_read_row := 0.U
+    } .elsewhen (mesh.io.resp.valid && mesh.io.resp.bits.tag.rob_id.valid) {
       mx_a_read_row := wrappingAdd(mx_a_read_row, 1.U, mesh.io.resp.bits.total_rows)
     }
-    mx.read_a.valid := mesh.io.resp.valid && mesh.io.resp.bits.tag.mx_enabled
+    // Only read on real, committed output rows. Garbage/bubble outputs
+    // (`rob_id.valid=false`) are never scaled, so reading their scales just wastes SRAM
+    // read energy and (without this gate) the wasted reads alias onto the delayed bubble.
+    mx.read_a.valid := mesh.io.resp.valid && mesh.io.resp.bits.tag.mx_enabled &&
+      mesh.io.resp.bits.tag.rob_id.valid
     mx.read_a.bits.addr := mx_a_read_row
     assert(!mx.read_a.valid || mx.read_a.ready, "MXScaleSRAM A read port must accept scale vector reads")
 
@@ -1065,7 +1071,8 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     // pipelined together (DIM=16). Unlike A (indexed by output row), B is indexed by the K
     // block, so no row counter is needed. The B exponent vector spans the N output columns.
     val b_scale_base = (mx_scale_sp_entries / 2).U(mx_scale_addr_bits.W)
-    mx.read_b.valid := mesh.io.resp.valid && mesh.io.resp.bits.tag.mx_enabled
+    mx.read_b.valid := mesh.io.resp.valid && mesh.io.resp.bits.tag.mx_enabled &&
+      mesh.io.resp.bits.tag.rob_id.valid
     mx.read_b.bits.addr := b_scale_base + mx_out_block_u
     assert(!mx.read_b.valid || mx.read_b.ready, "MXScaleSRAM B read port must accept scale vector reads")
   }
@@ -1094,7 +1101,17 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
   if (mx_enabled) {
     val mx = io.mx.get
-    val mx_raw_half = Reg(Vec(block_size, Vec(meshColumns, Vec(tileColumns, SInt(64.W)))))
+    // First-half raw-partial buffer for the DIM<block two-phase path only. It holds one
+    // output tile of raw mesh partials at the spatial-array output width (SInt(20) here),
+    // not 64 bits: a summed 32-lane block is <= 32*127^2 < 2^20. At DIM == mx_block_size one
+    // physical phase is a whole logical block, so the buffer is never read/written and is
+    // not instantiated at all.
+    val mx_raw_half = if (DIM < mx_block_size) {
+      Some(Reg(Vec(block_size, Vec(meshColumns, Vec(tileColumns,
+        SInt(spatialArrayOutputType.getWidth.W))))))
+    } else {
+      None
+    }
     val mx_resp_is_scaled = mesh_resp_valid && mesh_resp.tag.mx_enabled
     val mx_dim16_first_half = (DIM < mx_block_size).B && mx_resp_is_scaled && !mx_out_second_half
     val mx_dim16_second_half = (DIM < mx_block_size).B && mx_resp_is_scaled && mx_out_second_half
@@ -1159,19 +1176,29 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     // this guard they re-store `mx_raw_half(0)` with zero between the two phases,
     // so the second half reads 0 and only one 16-wide half reaches the
     // accumulator (output = one half instead of the summed block).
-    when (mx_dim16_first_half && start_array_outputting && write_this_row) {
-      mx_raw_half(output_counter) := VecInit(mesh_resp.data.map(v =>
-        VecInit(v.map(_.asUInt.asSInt.pad(64)))))
+    if (DIM < mx_block_size) {
+      when (mx_dim16_first_half && start_array_outputting && write_this_row) {
+        mx_raw_half.get(output_counter) := VecInit(mesh_resp.data.map(v =>
+          VecInit(v.map(_.asUInt.asSInt))))
+      }
     }
 
     mx_suppress_acc_write := mx_dim16_first_half
     mx_acc_wdata := VecInit(mesh_resp.data.zipWithIndex.map { case (col, colId) =>
       VecInit(col.zipWithIndex.map { case (elem, tileId) =>
         val lane = colId * tileColumns + tileId
-        val raw_current = elem.asUInt.asSInt.pad(64)
-        val raw_block = Mux(mx_dim16_second_half,
-          mx_raw_half(output_counter)(colId)(tileId) + raw_current,
-          raw_current)
+        val raw_current = elem.asUInt.asSInt
+        // Sum the two physical K phases of one logical block before a single scale
+        // application (DIM<block). The 20-bit half plus the 20-bit current partial use a
+        // widening add so the 21-bit block sum cannot wrap. At DIM == mx_block_size one
+        // phase is the whole block, so there is no buffered half to add.
+        val raw_block = if (DIM < mx_block_size) {
+          Mux(mx_dim16_second_half,
+            mx_raw_half.get(output_counter)(colId)(tileId) +& raw_current,
+            raw_current)
+        } else {
+          raw_current
+        }
         val scale_shift = (a_exp +& b_exp(lane)).asSInt - (2 * mx_int_frac_bits).S(mx_scale_exp_bits.W)
         saturateToAcc(scalePowerOfTwo(raw_block, scale_shift))
       })

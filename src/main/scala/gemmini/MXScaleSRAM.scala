@@ -38,8 +38,7 @@ class MXScaleSRAMReadReq(entries: Int) extends Bundle {
   val addr = UInt(log2Up(entries).W)
 }
 
-class MXScaleSRAMReadResp(lanes: Int, scaleBits: Int, expBits: Int) extends Bundle {
-  val raw = Vec(lanes, UInt(scaleBits.W))
+class MXScaleSRAMReadResp(lanes: Int, expBits: Int) extends Bundle {
   val exp = Vec(lanes, SInt(expBits.W))
   val invalid = Vec(lanes, Bool())
 }
@@ -48,8 +47,8 @@ class MXScaleSRAMIO(entries: Int, lanes: Int, scaleBits: Int, expBits: Int) exte
   val write = Flipped(Decoupled(new MXScaleSRAMWriteReq(entries, lanes, scaleBits)))
   val read_a = Flipped(Decoupled(new MXScaleSRAMReadReq(entries)))
   val read_b = Flipped(Decoupled(new MXScaleSRAMReadReq(entries)))
-  val resp_a = Valid(new MXScaleSRAMReadResp(lanes, scaleBits, expBits))
-  val resp_b = Valid(new MXScaleSRAMReadResp(lanes, scaleBits, expBits))
+  val resp_a = Valid(new MXScaleSRAMReadResp(lanes, expBits))
+  val resp_b = Valid(new MXScaleSRAMReadResp(lanes, expBits))
   val busy = Output(Bool())
 }
 
@@ -61,12 +60,13 @@ class MXScaleSRAM[T <: Data : Arithmetic, U <: Data, V <: Data](config: GemminiA
 
   val io = IO(new MXScaleSRAMIO(entries, lanes, scaleBits, expBits))
 
-  private val rawA = SyncReadMem(entries, Vec(lanes, UInt(scaleBits.W)))
-  private val rawB = SyncReadMem(entries, Vec(lanes, UInt(scaleBits.W)))
+  // Only the predecoded E8M0 exponents are stored. The raw scale bytes are never
+  // read back by any consumer, and the per-lane invalid flag is fully derivable
+  // from the exponent (`exp === 128` iff the byte was the rejected 0xff NaN), so
+  // neither needs its own SyncReadMem. This keeps the sidecar metadata SRAM to two
+  // memories instead of six.
   private val expA = SyncReadMem(entries, Vec(lanes, SInt(expBits.W)))
   private val expB = SyncReadMem(entries, Vec(lanes, SInt(expBits.W)))
-  private val invalidA = SyncReadMem(entries, Vec(lanes, Bool()))
-  private val invalidB = SyncReadMem(entries, Vec(lanes, Bool()))
 
   private def decodeE8M0(byte: UInt): SInt = {
     (Cat(0.U(1.W), byte).asSInt - 127.S(expBits.W)).asSInt
@@ -81,13 +81,9 @@ class MXScaleSRAM[T <: Data : Arithmetic, U <: Data, V <: Data](config: GemminiA
   when (io.write.fire) {
     assert(!maskedInvalid, "MXINT8 v1 rejects E8M0 NaN scale byte 0xff")
     when (io.write.bits.is_b) {
-      rawB.write(io.write.bits.addr, io.write.bits.bytes, io.write.bits.mask)
       expB.write(io.write.bits.addr, decoded, io.write.bits.mask)
-      invalidB.write(io.write.bits.addr, invalid, io.write.bits.mask)
     } .otherwise {
-      rawA.write(io.write.bits.addr, io.write.bits.bytes, io.write.bits.mask)
       expA.write(io.write.bits.addr, decoded, io.write.bits.mask)
-      invalidA.write(io.write.bits.addr, invalid, io.write.bits.mask)
     }
   }
 
@@ -97,15 +93,19 @@ class MXScaleSRAM[T <: Data : Arithmetic, U <: Data, V <: Data](config: GemminiA
   val readAFire = io.read_a.fire
   val readBFire = io.read_b.fire
 
-  io.resp_a.valid := RegNext(readAFire, false.B)
-  io.resp_a.bits.raw := rawA.read(io.read_a.bits.addr, readAFire)
-  io.resp_a.bits.exp := expA.read(io.read_a.bits.addr, readAFire)
-  io.resp_a.bits.invalid := invalidA.read(io.read_a.bits.addr, readAFire)
+  // E8M0 0xff decodes to 255 - 127 = 128; no valid byte (0..254) reaches it, so the
+  // invalid flag is exactly `exp === 128` recomputed from the exponent read.
+  private val invalidExp = 128.S(expBits.W)
 
+  val expReadA = expA.read(io.read_a.bits.addr, readAFire)
+  io.resp_a.valid := RegNext(readAFire, false.B)
+  io.resp_a.bits.exp := expReadA
+  io.resp_a.bits.invalid := VecInit(expReadA.map(_ === invalidExp))
+
+  val expReadB = expB.read(io.read_b.bits.addr, readBFire)
   io.resp_b.valid := RegNext(readBFire, false.B)
-  io.resp_b.bits.raw := rawB.read(io.read_b.bits.addr, readBFire)
-  io.resp_b.bits.exp := expB.read(io.read_b.bits.addr, readBFire)
-  io.resp_b.bits.invalid := invalidB.read(io.read_b.bits.addr, readBFire)
+  io.resp_b.bits.exp := expReadB
+  io.resp_b.bits.invalid := VecInit(expReadB.map(_ === invalidExp))
 
   io.busy := false.B
 }
