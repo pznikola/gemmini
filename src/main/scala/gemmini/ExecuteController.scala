@@ -997,84 +997,72 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   // val output_counter = new Counter(block_size)
   val output_counter = RegInit(0.U(log2Up(block_size).W))
 
-  val mx_delay_outputs = mx_enabled.B && mx_runtime_enabled
-  val mx_mesh_resp_valid = if (mx_enabled) RegNext(mesh.io.resp.valid, false.B) else false.B
-  val mx_mesh_resp_bits = if (mx_enabled) RegEnable(mesh.io.resp.bits, mesh.io.resp.valid) else Wire(chiselTypeOf(mesh.io.resp.bits))
-  if (!mx_enabled) {
-    // Delayed-output shadow register is only consumed inside `if (mx_enabled)`;
-    // drive it when MX is disabled to avoid an undriven sink at elaboration.
-    mx_mesh_resp_bits := DontCare
-  }
+  // MXINT8 Part B: the mesh output is consumed in the *undelayed* domain. The scale exponents
+  // are read one cycle ahead from MXScaleSRAM -- one read per cycle, matching the
+  // one-row-per-cycle drain -- so the 1-cycle SyncReadMem latency is hidden without delaying
+  // the data. This removes the former DIM*DIM-wide one-cycle output-delay shadow register
+  // (`mx_mesh_resp_bits`) entirely; the read keeps exact pace with the drain (no batch gather).
   val mesh_resp = Wire(chiselTypeOf(mesh.io.resp.bits))
   val mesh_resp_valid = Wire(Bool())
-
   mesh_resp := mesh.io.resp.bits
   mesh_resp_valid := mesh.io.resp.valid
 
-  // Output-domain re-derivation of (logical K block, second-half) for the DIM<block
-  // two-phase path. The feed-time tag fields (`tag.mx_block`/`tag.mx_second_half`, sampled
-  // from the live `mx_k_lane_counter` at enqueue) drift one physical phase relative to the
-  // output at a logical-block boundary: under WS preload/compute fusion plus the mesh's +2
-  // tag latency, the counter sample and the output association are taken at different points
-  // (the C address rides the tag FIFO correctly, so the accumulate bit is right; these
-  // counter samples do not). Recover the truth from the strict FIFO drain order instead --
-  // WS outputs leave the array one real matmul per K phase, in issue order -- with a phase
-  // counter that ticks once per drained MX matmul: block = phase >> 1, second_half = phase(0).
-  // Mirror the `mx_a_read_row` (undelayed) / `output_counter` (delayed) split so the
-  // undelayed value addresses the B-scale SRAM read and the delayed value drives the scaling,
-  // staying aligned across the 1-cycle `mx_delay_outputs` delay. DIM=32 (one phase per block,
-  // tag already correct) keeps the tag fields unchanged.
-  val (mx_out_block_u, mx_out_block, mx_out_second_half) =
-    if (mx_enabled && DIM < mx_block_size) {
-      val mx_phase = RegInit(0.U((mx_scale_addr_bits + 1).W))
-      when (mx_reset) {
-        mx_phase := 0.U
-      } .elsewhen (mesh.io.resp.valid && mesh.io.resp.bits.last &&
-          mesh.io.resp.bits.tag.rob_id.valid && mesh.io.resp.bits.tag.mx_enabled) {
-        mx_phase := mx_phase + 1.U
-      }
-      val mx_phase_d = RegNext(mx_phase, 0.U)
-      ((mx_phase >> 1).asUInt, (mx_phase_d >> 1).asUInt, mx_phase_d(0))
-    } else {
-      (mesh.io.resp.bits.tag.mx_block, mesh_resp.tag.mx_block, mesh_resp.tag.mx_second_half)
+  // Drain-order matmul index: ticks once per drained MX matmul (one physical K phase). The
+  // logical block is `mx_matmul >> log2(phases-per-block)`, and for DIM<block the two-phase
+  // second-half bit is `mx_matmul(0)`. This recovers the (block, half) association from the
+  // strict drain order, since the feed-sampled tag fields drift one phase (the D4 effect).
+  val mx_block_shift = log2Ceil(mx_block_size / DIM)
+  val mx_matmul = if (mx_enabled) RegInit(0.U((mx_scale_addr_bits + 1).W)) else 0.U
+  if (mx_enabled) {
+    when (mx_reset) {
+      mx_matmul := 0.U
+    } .elsewhen (mesh_resp_valid && mesh_resp.last &&
+        mesh_resp.tag.rob_id.valid && mesh_resp.tag.mx_enabled) {
+      mx_matmul := mx_matmul + 1.U
     }
+  }
+  val mx_drain_block = (mx_matmul >> mx_block_shift).asUInt
+  val mx_out_second_half = if (mx_enabled && DIM < mx_block_size) mx_matmul(0) else false.B
+
+  // Scales for the currently-draining output: A exponent for this row, B exponent vector for
+  // the N output columns (invalid is re-derived as `exp === 128`). Driven by the read-ahead
+  // below; consumed by the BlockScaleUnit (a separate `if (mx_enabled)` block).
+  val mx_set_a_exp = Wire(SInt(mx_scale_exp_bits.W))
+  val mx_set_b_exp = Wire(Vec(DIM, SInt(mx_scale_exp_bits.W)))
+  val mx_set_valid = Wire(Bool())
+  if (!mx_enabled) {
+    mx_set_a_exp := DontCare
+    mx_set_b_exp := DontCare
+    mx_set_valid := false.B
+  }
 
   if (mx_enabled) {
-    mesh_resp := Mux(mx_delay_outputs, mx_mesh_resp_bits, mesh.io.resp.bits)
-    mesh_resp_valid := Mux(mx_delay_outputs, mx_mesh_resp_valid, mesh.io.resp.valid)
-
     val mx = io.mx.get
-    // The A-scale SRAM read is issued in the *undelayed* mesh-output domain so its
-    // 1-cycle SyncReadMem latency overlaps the 1-cycle output delay
-    // (`mx_delay_outputs`). `output_counter` advances on the *delayed* output
-    // stream and so lags the undelayed row index by one, which would feed output
-    // row i the A scale of row i-1. Track the undelayed row index with a dedicated
-    // counter that mirrors `output_counter`'s increment one cycle earlier.
-    val mx_a_read_row = RegInit(0.U(log2Up(block_size).W))
-    when (mx_reset) {
-      mx_a_read_row := 0.U
-    } .elsewhen (mesh.io.resp.valid && mesh.io.resp.bits.tag.rob_id.valid) {
-      mx_a_read_row := wrappingAdd(mx_a_read_row, 1.U, mesh.io.resp.bits.total_rows)
-    }
-    // Only read on real, committed output rows. Garbage/bubble outputs
-    // (`rob_id.valid=false`) are never scaled, so reading their scales just wastes SRAM
-    // read energy and (without this gate) the wasted reads alias onto the delayed bubble.
-    mx.read_a.valid := mesh.io.resp.valid && mesh.io.resp.bits.tag.mx_enabled &&
-      mesh.io.resp.bits.tag.rob_id.valid
-    mx.read_a.bits.addr := mx_a_read_row
-    assert(!mx.read_a.valid || mx.read_a.ready, "MXScaleSRAM A read port must accept scale vector reads")
-
-    // The B-scale SRAM read is issued in the same *undelayed* mesh-output domain,
-    // addressed by the output's own logical K block (`mx_out_block_u`, re-derived from the
-    // output-domain phase counter), so its 1-cycle latency aligns with the delayed output
-    // and each block's rows are scaled by their own B exponents even when several blocks are
-    // pipelined together (DIM=16). Unlike A (indexed by output row), B is indexed by the K
-    // block, so no row counter is needed. The B exponent vector spans the N output columns.
     val b_scale_base = (mx_scale_sp_entries / 2).U(mx_scale_addr_bits.W)
-    mx.read_b.valid := mesh.io.resp.valid && mesh.io.resp.bits.tag.mx_enabled &&
-      mesh.io.resp.bits.tag.rob_id.valid
-    mx.read_b.bits.addr := b_scale_base + mx_out_block_u
-    assert(!mx.read_b.valid || mx.read_b.ready, "MXScaleSRAM B read port must accept scale vector reads")
+    val draining = mesh_resp_valid && mesh_resp.tag.rob_id.valid
+
+    // Read one cycle ahead: address the output that will drain *next* -- the next row within
+    // this matmul, or row 0 / the next block at a matmul boundary, holding the address during
+    // bubbles. The SyncReadMem response one cycle later therefore lines up with the next
+    // drained output, and one read per cycle keeps exact pace with the drain.
+    mx.read_a.valid := mx_runtime_enabled
+    mx.read_a.bits.addr := Mux(draining,
+      wrappingAdd(output_counter, 1.U, mesh_resp.total_rows), output_counter)
+
+    val mx_next_block = ((mx_matmul + 1.U) >> mx_block_shift).asUInt
+    mx.read_b.valid := mx_runtime_enabled
+    mx.read_b.bits.addr := b_scale_base +
+      Mux(draining && mesh_resp.last, mx_next_block, mx_drain_block)
+
+    assert(!(mx.read_a.valid && !mx.read_a.ready), "MXScaleSRAM A read port must accept scale vector reads")
+    assert(!(mx.read_b.valid && !mx.read_b.ready), "MXScaleSRAM B read port must accept scale vector reads")
+
+    // Consume the responses (one cycle behind the read, so aligned with this drained output).
+    // A selects the block's lane; B spans the N output columns.
+    val lane = mx_drain_block(log2Ceil(DIM) - 1, 0)
+    mx_set_a_exp := mx.resp_a.bits.exp(lane)
+    mx_set_b_exp := mx.resp_b.bits.exp
+    mx_set_valid := mx.resp_a.valid && mx.resp_b.valid
   }
 
   val w_total_output_rows = mesh_resp.total_rows
@@ -1115,7 +1103,6 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     val mx_resp_is_scaled = mesh_resp_valid && mesh_resp.tag.mx_enabled
     val mx_dim16_first_half = (DIM < mx_block_size).B && mx_resp_is_scaled && !mx_out_second_half
     val mx_dim16_second_half = (DIM < mx_block_size).B && mx_resp_is_scaled && mx_out_second_half
-    val mx_a_scale_lane = mx_out_block(log2Ceil(DIM) - 1, 0)
 
     def roundRightNearestEven(value: SInt, shift: UInt): SInt = {
       val width = 64
@@ -1159,14 +1146,14 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       clipped(accType.getWidth - 1, 0).asTypeOf(accType)
     }
 
-    val a_exp = mx.resp_a.bits.exp(mx_a_scale_lane)
-    val a_invalid = mx.resp_a.bits.invalid(mx_a_scale_lane)
-    // B scale read at output time (issued in the undelayed domain above, addressed by
-    // this output's K block); the response aligns with the delayed output and is
-    // indexed per N output column. `b_exp(lane)` replaces the old feed-time latch.
-    val b_exp = mx.resp_b.bits.exp
-    val mx_b_scale_invalid = mx.resp_b.bits.invalid
-    val mx_b_scale_valid = mx.resp_b.valid
+    // Scales come from the prefetch FIFO (gathered in issue order), available
+    // combinationally for the undelayed output. A is indexed by this output's row; B spans
+    // the N output columns. Invalid is re-derived as `exp === 128` (the rejected 0xff NaN).
+    val a_exp = mx_set_a_exp
+    val a_invalid = mx_set_a_exp === 128.S(mx_scale_exp_bits.W)
+    val b_exp = mx_set_b_exp
+    val mx_b_scale_invalid = VecInit(mx_set_b_exp.map(_ === 128.S(mx_scale_exp_bits.W)))
+    val mx_b_scale_valid = mx_set_valid
 
     // Only buffer the first half on a real, committed output row, mirroring the
     // accumulator-write guards below. In weight-stationary mode the mesh also
@@ -1207,11 +1194,9 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     // Validate the scales only on real, committed output rows (not the WS bubble /
     // garbage-address cycles, which carry stale scale lanes).
     when (mx_resp_is_scaled && !mx_dim16_first_half && start_array_outputting && write_this_row) {
-      assert(mx.resp_a.valid, "MXINT8 output reached BlockScaleUnit before A scale vector was valid")
-      assert(mx_b_scale_valid, "MXINT8 output reached BlockScaleUnit before B scale vector was valid")
+      assert(mx_set_valid, "MXINT8 output reached BlockScaleUnit before its prefetched scale set was ready")
       assert(!a_invalid, "MXINT8 A scale vector contains invalid E8M0 scale")
       assert(!mx_b_scale_invalid.asUInt.orR, "MXINT8 B scale vector contains invalid E8M0 scale")
-      assert(mx_a_scale_lane < DIM.U, "MXINT8 A scale lane is outside the loaded sidecar row")
     }
   }
 
