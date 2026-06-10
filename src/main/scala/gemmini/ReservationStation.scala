@@ -431,7 +431,17 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
         when (!set_only_strides) {
           a_transpose := new_entry.cmd.cmd.rs1(8) // TODO magic numbers
         }
-      }.elsewhen(new_entry.is_config && new_entry.q === ldqu) {
+      }.elsewhen(new_entry.is_config && new_entry.q === ldqu && !new_entry.is_mx_scale) {
+        // MXINT8 scale-vector mvins are `is_config` (they carry no spad address range), but they
+        // are NOT CONFIG_LOAD instructions: their rs1 is the scale buffer's DRAM POINTER. Without
+        // the `is_mx_scale` exclusion above, pointer bits were decoded as a config here --
+        // id = rs1(4,3) (0 for a 64-aligned buffer = the A mvin's load id) and pixel_repeats /
+        // block_stride from rs1(15,8)/rs1(31,16) -- corrupting the RS's mirror of the load
+        // config. Later payload-mvin allocations then computed their DEPENDENCY ranges with the
+        // garbage (`floorSub(pixel_repeats)` shifted the A mvin's range), the compute's RAW
+        // overlap check missed the in-flight A mvin, and the compute issued while the A tile was
+        // still being DMA-written: the mesh was fed stale scratchpad rows. This was the real
+        // cause of the "loop multi-block inter-GEMM" corruption (see DOCS_MX/BUG.md).
         val id = new_entry.cmd.cmd.rs1(4,3) // TODO magic numbers
         val block_stride = new_entry.cmd.cmd.rs1(31, 16) // TODO magic numbers
         val repeat_pixels = maxOf(new_entry.cmd.cmd.rs1(8 + pixel_repeats_bits - 1, 8), 1.U) // TODO we use a default value of pixel repeats here, for backwards compatibility. However, we should deprecate and remove this default value eventually
