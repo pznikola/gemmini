@@ -39,7 +39,11 @@ for arg in "$@"; do
 done
 
 # --- Environment (JDK trap: system JDK 21 shadows conda JDK 20) --------------------
+# env.sh's conda activate scripts reference variables that are unset on first entry,
+# so nounset must be off while sourcing it.
+set +u
 source "$REPO/env.sh" || { echo "FATAL: env.sh failed"; exit 1; }
+set -u
 export PATH="$CONDA_PREFIX/bin:$PATH"
 java -version 2>&1 | grep -q 'version "20' \
   || { echo "FATAL: JDK 20 not active (JDK trap — see AGENT.md §1)"; exit 1; }

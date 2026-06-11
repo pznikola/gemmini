@@ -72,6 +72,16 @@ header (`MX_ENABLED 0`). Before building MX tests, stage
 Makefile flags + `-T riscv-tests/benchmarks/common/test.ld` (the system elf-gcc lacks
 newlib). New test = drop `bareMetalC/<name>.c`, add to `tests` in `bareMetalC/Makefile`.
 
+**External oracle (host, P1):** chipyard-root venv `.mx-venv` (untracked; conda Python
+3.14 + CPU torch 2.12 + `pip install --no-deps git+https://github.com/microsoft/microxcaling`
+— its `torch==2.2.0` pin has no cp314 wheel, the CPU path runs fine on newer torch; plus
+`numpy packaging`). Run from `gemmini-rocc-tests/`:
+```bash
+/abs/path/.mx-venv/bin/python3 tools/mxint8_external_diff.py --sweep \
+  --json-out build/mxint8_external_diff_sweep.json
+```
+It self-compiles `tools/mxint8_host_ref.c` with host gcc against staged MX headers.
+
 ### 1.4 Run on RTL
 ```bash
 make -C sims/verilator CONFIG=<Config> run-binary BINARY=<abs path>-baremetal \
@@ -281,12 +291,12 @@ format. MXINT16 is an "MX-consistent generalization" within the spec's §5.1 fra
 | `mxint8_golden` | PASS | — |
 | `mxint8_matmul_dim32` (probe K=32 + random K=64) | PASS | — |
 | `mxint8_matmul_dim16` (probe, random K=32, xprobe K=64/128, random K=64/96) | — | PASS |
-| `mxint8_corner` (8 cases; +−128 case from P1) | PASS | — |
+| `mxint8_corner` (12 cases incl. the P1 −128 quartet) | PASS | — |
 | `mxint8_matmul_partial` (6 cases) | PASS | — |
 | `mxint8_tiled` (wrapper K=32 → K=64 BtB) | PASS | — |
 | `mxint8_btb` (+ probe build) | PASS | — |
 | `mxint8_multitile` (from P3) | PASS | PASS |
-| `tools/mxint8_external_diff.py` (from P1) | host | host |
+| `tools/mxint8_external_diff.py --sweep` (microxcaling oracle, host `.mx-venv`) | host | host |
 | Stock `GemminiRocketConfig` elaboration | 0 firtool errors | — |
 
 Plus per-phase additions (transpose/OS test from P5; MXINT16 suite from P10). Bit-exact
@@ -315,3 +325,29 @@ documented in the §5 log with the reason.
   CODING_STYLES/, DOCS_MX/, mxint8_policy.md). Not yet done: fresh-checkout rebuild +
   full matrix re-run (O(hours) — run before the P2 numbers are published); nothing
   pushed to any remote (user's call). **Next: P1 (OCP conformance audit).**
+- **2026-06-11 — P1 OCP MX v1.0 conformance audit: DONE.** Deliverables: (1)
+  `DOCS_MX/OCP_CONFORMANCE.md` — 16-row clause-by-clause matrix (every normative §5/§6
+  clause → behavior+evidence → CONFORM / DEVIATION / N.A.); finding: §5.1 *sanctions* the
+  separate scale sidecar. (2) Packer switched to the spec-§6.3 recommended algorithm in
+  `include/mxint8_pack.h` (`e = floor(log2(amax))`, reachable ±127 clamp; new
+  `mxint8_floor_log2f`; two exact pow2 multiplies to avoid `2^(6-e)` fp32 overflow for
+  e<-121). Golden GEMM + RTL unaffected by construction (they consume given
+  payload+scale); all packer-dependent tests re-green. (3) External oracle implemented:
+  `tools/mxint8_host_ref.c` (runs the in-repo packer+golden on the host) +
+  `tools/mxint8_external_diff.py` vs **microsoft/microxcaling** (3 checks: §6.3 scale
+  byte, bit-exact dequant, exact-integer policy GEMM) — `--sweep` **PASS over 8000 blocks,
+  4000 in the old divergence band** `amax∈(1.984·2^j,2·2^j)`; negative control confirms
+  the pre-P1 packer fails the band (e=1/p=64 vs spec e=0/p=127). venv `.mx-venv`
+  (untracked, gitignored; Python 3.14 + CPU torch 2.12 + microxcaling 1.1.0 via
+  `--no-deps`). (4) `mxint8_corner.c` −128 cases. **New finding (D3):** the RES-OPT mesh
+  output `SInt(20.W)` holds the packer's `32·127²=516128` bound but is one LSB short of
+  the worst-case all-±128 block `32·128²=2^19=524288`; the int64 golden is unaffected.
+  Fixed the cases to 31 saturating −128 lanes (raw 507904, in-envelope) — all 12 corner
+  cases PASS on RTL (`neg128_exact=507904`, `neg128_sat=INT32_MAX`, `neg128_round=8`,
+  `neg128mix`); the all-±128 overflow is documented as deviation D3, **not** fixed
+  (widening the mesh is DO-NOT-TOUCH and would regress RES-OPT, to represent data the
+  packer never emits). (5) `mxint8_policy.md` → v1.1 (spec-§6.3 packing section,
+  normative mapping, deviations D1 NaN-reject / D2 int32-acc / D3 −128-envelope; GEMM
+  semantics unchanged). Regression: full §4 matrix green (corner re-verified in isolation
+  post-fix; a consolidated re-run was launched). Nothing committed or pushed (user
+  commits). **Next: P2 (counters + synthesis numbers).**
