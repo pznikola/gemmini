@@ -45,6 +45,11 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       Some(new Bundle {
         val enable = Input(Bool())
         val reset = Input(Bool())
+        // Loop geometry from CONFIG_MXINT8 rs2 (policy Appendix A): output-tile counts and
+        // the padded power-of-two J pitch. 1/1/0 reproduces the single-tile v1 behavior.
+        val i_tiles = Input(UInt(16.W))
+        val j_tiles = Input(UInt(16.W))
+        val log2_jp = Input(UInt(4.W))
         val read_a = Decoupled(new MXScaleSRAMReadReq(mx_scale_sp_entries))
         val read_b = Decoupled(new MXScaleSRAMReadReq(mx_scale_sp_entries))
         val resp_a = Flipped(Valid(new MXScaleSRAMReadResp(DIM, mx_scale_exp_bits)))
@@ -1007,22 +1012,50 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   mesh_resp := mesh.io.resp.bits
   mesh_resp_valid := mesh.io.resp.valid
 
-  // Drain-order matmul index: ticks once per drained MX matmul (one physical K phase). The
-  // logical block is `mx_matmul >> log2(phases-per-block)`, and for DIM<block the two-phase
-  // second-half bit is `mx_matmul(0)`. This recovers the (block, half) association from the
-  // strict drain order, since the feed-sampled tag fields drift one phase (the D4 effect).
+  // Drain-order matmul indices (policy Appendix A): a chained wrapping walk
+  // (phase kp fastest, then tile_i, then tile_j, then logical block kb) ticks once per
+  // drained MX matmul (one physical K phase). This recovers the (tile, block, phase)
+  // association from the strict drain order, since the feed-sampled tag fields drift one
+  // phase (the D4 effect). At DIM == mx_block_size kp is constant 0 and the walk is the
+  // stock (i fastest, j, k slowest) order; at I_tiles == J_tiles == 1 it degenerates to
+  // the verified single-tile phase sequence. The walk is cross-checked against the
+  // tag-derived (tile_i, tile_j) at every committed output row (assert below).
   val mx_block_shift = log2Ceil(mx_block_size / DIM)
-  val mx_matmul = if (mx_enabled) RegInit(0.U((mx_scale_addr_bits + 1).W)) else 0.U
+  val mx_phases = mx_block_size / DIM
+  val mx_i_tiles = if (mx_enabled) io.mx.get.i_tiles else 1.U
+  val mx_j_tiles = if (mx_enabled) io.mx.get.j_tiles else 1.U
+  val mx_log2_jp = if (mx_enabled) io.mx.get.log2_jp else 0.U
+
+  val mx_out_kp = if (mx_enabled && mx_phases > 1) RegInit(0.U(mx_block_shift.W)) else 0.U(1.W)
+  val mx_out_i = if (mx_enabled) RegInit(0.U(16.W)) else 0.U
+  val mx_out_j = if (mx_enabled) RegInit(0.U(16.W)) else 0.U
+  val mx_out_kb = if (mx_enabled) RegInit(0.U((mx_scale_addr_bits + 1).W)) else 0.U
+
+  // Combinational next-state of the walk, used by the one-cycle-ahead scale reads.
+  val mx_kp_wrap = if (mx_phases > 1) mx_out_kp === (mx_phases - 1).U else true.B
+  val mx_i_wrap = mx_kp_wrap && (mx_out_i + 1.U === mx_i_tiles)
+  val mx_j_wrap = mx_i_wrap && (mx_out_j + 1.U === mx_j_tiles)
+  val mx_next_kp = Mux(mx_kp_wrap, 0.U, mx_out_kp + 1.U)
+  val mx_next_i = Mux(!mx_kp_wrap, mx_out_i, Mux(mx_i_wrap, 0.U, mx_out_i + 1.U))
+  val mx_next_j = Mux(!mx_i_wrap, mx_out_j, Mux(mx_j_wrap, 0.U, mx_out_j + 1.U))
+  val mx_next_kb = mx_out_kb + mx_j_wrap
+
   if (mx_enabled) {
     when (mx_reset) {
-      mx_matmul := 0.U
+      if (mx_phases > 1) { mx_out_kp := 0.U }
+      mx_out_i := 0.U
+      mx_out_j := 0.U
+      mx_out_kb := 0.U
     } .elsewhen (mesh_resp_valid && mesh_resp.last &&
         mesh_resp.tag.rob_id.valid && mesh_resp.tag.mx_enabled) {
-      mx_matmul := mx_matmul + 1.U
+      if (mx_phases > 1) { mx_out_kp := mx_next_kp }
+      mx_out_i := mx_next_i
+      mx_out_j := mx_next_j
+      mx_out_kb := mx_next_kb
     }
   }
-  val mx_drain_block = (mx_matmul >> mx_block_shift).asUInt
-  val mx_out_second_half = if (mx_enabled && DIM < mx_block_size) mx_matmul(0) else false.B
+  val mx_drain_block = mx_out_kb
+  val mx_out_second_half = if (mx_enabled && DIM < mx_block_size) mx_out_kp(0) else false.B
 
   // Scales for the currently-draining output: A exponent for this row, B exponent vector for
   // the N output columns (invalid is re-derived as `exp === 128`). Driven by the read-ahead
@@ -1042,17 +1075,23 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     val draining = mesh_resp_valid && mesh_resp.tag.rob_id.valid
 
     // Read one cycle ahead: address the output that will drain *next* -- the next row within
-    // this matmul, or row 0 / the next block at a matmul boundary, holding the address during
-    // bubbles. The SyncReadMem response one cycle later therefore lines up with the next
-    // drained output, and one read per cycle keeps exact pace with the drain.
-    mx.read_a.valid := mx_runtime_enabled
-    mx.read_a.bits.addr := Mux(draining,
+    // this matmul, or row 0 of the next matmul (with the *next* walk indices) at a matmul
+    // boundary, holding the address during bubbles. The SyncReadMem response one cycle later
+    // therefore lines up with the next drained output, and one read per cycle keeps exact
+    // pace with the drain.
+    // A-scale row (Appendix A.2): tile_i*DIM + output_row.
+    val mx_a_row = Mux(draining,
       wrappingAdd(output_counter, 1.U, mesh_resp.total_rows), output_counter)
+    val mx_a_tile = Mux(draining && mesh_resp.last, mx_next_i, mx_out_i)
+    mx.read_a.valid := mx_runtime_enabled
+    mx.read_a.bits.addr := (mx_a_tile << log2Ceil(DIM)).asUInt + mx_a_row
 
-    val mx_next_block = ((mx_matmul + 1.U) >> mx_block_shift).asUInt
+    // B-scale row (Appendix A.2): b_scale_base + kb*Jp + tile_j.
+    val mx_b_row = (mx_out_kb << mx_log2_jp).asUInt + mx_out_j
+    val mx_b_row_next = (mx_next_kb << mx_log2_jp).asUInt + mx_next_j
     mx.read_b.valid := mx_runtime_enabled
     mx.read_b.bits.addr := b_scale_base +
-      Mux(draining && mesh_resp.last, mx_next_block, mx_drain_block)
+      Mux(draining && mesh_resp.last, mx_b_row_next, mx_b_row)
 
     assert(!(mx.read_a.valid && !mx.read_a.ready), "MXScaleSRAM A read port must accept scale vector reads")
     assert(!(mx.read_b.valid && !mx.read_b.ready), "MXScaleSRAM B read port must accept scale vector reads")
@@ -1197,6 +1236,23 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       assert(mx_set_valid, "MXINT8 output reached BlockScaleUnit before its prefetched scale set was ready")
       assert(!a_invalid, "MXINT8 A scale vector contains invalid E8M0 scale")
       assert(!mx_b_scale_invalid.asUInt.orR, "MXINT8 B scale vector contains invalid E8M0 scale")
+    }
+
+    // Appendix A.1 cross-check: the tag-derived output tile (recovered from the C
+    // accumulator row by bit slicing under the padded power-of-two pitch, with the loop
+    // unroller's double-buffer base masked off) must agree with the drain-order walk on
+    // every committed output row. Only meaningful for true multi-tile loops; raw
+    // single-tile intrinsics may carry metadata bits in the address that this slicing
+    // does not model.
+    val mx_acc_tiles_half = (acc_banks * acc_bank_entries) / (2 * DIM)
+    val mx_tag_t = (mesh_resp.tag.addr.acc_row() >> log2Ceil(DIM)).asUInt &
+      (mx_acc_tiles_half - 1).U
+    val mx_tag_tj = mx_tag_t & ((1.U << mx_log2_jp).asUInt - 1.U)
+    val mx_tag_ti = (mx_tag_t >> mx_log2_jp).asUInt
+    when (mx_resp_is_scaled && start_array_outputting && write_this_row &&
+        (mx_i_tiles > 1.U || mx_j_tiles > 1.U)) {
+      assert(mx_tag_ti === mx_out_i && mx_tag_tj === mx_out_j,
+        "MXINT8 multi-tile: tag-derived output tile disagrees with the drain-order walk")
     }
   }
 

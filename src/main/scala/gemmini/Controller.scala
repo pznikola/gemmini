@@ -264,7 +264,8 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     inputType.getWidth, accType.getWidth, dma_maxbytes, new MvinRs2(mvin_rows_bits, mvin_cols_bits, local_addr_t),
     new PreloadRs(mvin_rows_bits, mvin_cols_bits, local_addr_t), new PreloadRs(mvout_rows_bits, mvout_cols_bits, local_addr_t),
     new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t), new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t),
-    new MvoutSpadRs1(32, local_addr_t), new MvoutRs2(mvout_rows_bits, mvout_cols_bits, local_addr_t)) }
+    new MvoutSpadRs1(32, local_addr_t), new MvoutRs2(mvout_rows_bits, mvout_cols_bits, local_addr_t),
+    mx_enabled, mx_block_size) }
 
   val unrolled_cmd = Queue(loop_cmd)
   unrolled_cmd.ready := false.B
@@ -274,6 +275,12 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   val mx_scale_stride_a = RegInit(0.U(coreMaxAddrBits.W))
   val mx_scale_stride_b = RegInit(0.U(coreMaxAddrBits.W))
   val mx_config_pulse = WireInit(false.B)
+  // MX loop geometry (policy Appendix A), captured from CONFIG_MXINT8 rs2 on the plain
+  // enable sub-command. 1/1/0 is the single-tile v1 shape; rs2 == 0 maps to it so
+  // pre-Appendix-A callers are unchanged.
+  val mx_loop_i_tiles = RegInit(1.U(16.W))
+  val mx_loop_j_tiles = RegInit(1.U(16.W))
+  val mx_loop_log2_jp = RegInit(0.U(4.W))
 
   // Wire up controllers to ROB
   reservation_station.io.alloc.valid := false.B
@@ -386,6 +393,9 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     val scale_sram = mx_scale_sram.get
     ex_mx.enable := mx_runtime_enabled
     ex_mx.reset := mx_config_pulse
+    ex_mx.i_tiles := mx_loop_i_tiles
+    ex_mx.j_tiles := mx_loop_j_tiles
+    ex_mx.log2_jp := mx_loop_log2_jp
     scale_sram.io.read_a <> ex_mx.read_a
     scale_sram.io.read_b <> ex_mx.read_b
     ex_mx.resp_a := scale_sram.io.resp_a
@@ -559,6 +569,17 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
         } .otherwise {
           mx_scale_stride_a := unrolled_cmd.bits.cmd.rs2
         }
+      } .elsewhen (enable) {
+        // Plain enable sub-command: rs2 = {log2_Jp[39:32], J_tiles[31:16], I_tiles[15:0]}.
+        // Zero fields decay to the single-tile shape (1 tile, dense pitch).
+        val cfg_i_tiles = unrolled_cmd.bits.cmd.rs2(15, 0)
+        val cfg_j_tiles = unrolled_cmd.bits.cmd.rs2(31, 16)
+        val cfg_log2_jp = unrolled_cmd.bits.cmd.rs2(35, 32)
+        mx_loop_i_tiles := Mux(cfg_i_tiles === 0.U, 1.U, cfg_i_tiles)
+        mx_loop_j_tiles := Mux(cfg_j_tiles === 0.U, 1.U, cfg_j_tiles)
+        mx_loop_log2_jp := cfg_log2_jp
+        assert(cfg_j_tiles <= (1.U << cfg_log2_jp).asUInt || cfg_j_tiles === 0.U,
+          "CONFIG_MXINT8: J_tiles must fit the padded power-of-two pitch 2^log2_Jp")
       }
 
       unrolled_cmd.ready := true.B
