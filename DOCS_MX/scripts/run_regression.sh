@@ -23,8 +23,8 @@ DIM16_CONFIG="GemminiMXINT8DIM16RocketConfig"
 STOCK_CONFIG="GemminiRocketConfig"
 
 DIM32_TESTS="mxint8_golden mxint8_matmul_dim32 mxint8_corner mxint8_matmul_partial \
-             mxint8_tiled mxint8_btb"
-DIM16_TESTS="mxint8_matmul_dim16"
+             mxint8_tiled mxint8_btb mxint8_multitile"
+DIM16_TESTS="mxint8_matmul_dim16 mxint8_multitile"
 
 BUILD_SIMS=0
 RUN_DIM32=1
@@ -76,7 +76,7 @@ build_sim() {  # build_sim <Config>
 }
 
 run_one() {  # run_one <Config> <test>
-  make -C "$REPO/sims/verilator" CONFIG="$1" run-binary \
+  make -C "$REPO/sims/verilator" CONFIG="$1" run-binary-fast \
     BINARY="$BUILD_DIR/$2-baremetal" timeout_cycles=$TIMEOUT_CYCLES \
     > "/tmp/mx_run_$1_$2.log" 2>&1
 }

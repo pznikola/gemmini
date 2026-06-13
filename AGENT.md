@@ -28,9 +28,22 @@ publication plan), then `mxint8_policy.md` (the frozen numerical contract).
   track replanned for an **ACM TRETS journal paper** — see `DOCS_MX/RESEARCH_PLAN.md` +
   `DOCS_MX/PLAN_MX_UPDATED.md` (phases P0–P11). **P0 done 2026-06-10** (submodule committed on
   `mxint8_dev` + tagged `mxint8-rtl-verified-20260610`; docs committed; regression script at
-  `DOCS_MX/scripts/run_regression.sh`; fresh-checkout re-run deferred). Next: **P1** OCP MX
-  v1.0 conformance audit (spec-§6.3 packer algorithm, −128 corner test, microxcaling external
-  diff, policy v1.1), then **P2** counters/synthesis (the old R4).
+  `DOCS_MX/scripts/run_regression.sh`; fresh-checkout re-run deferred). **P1 done 2026-06-11** —
+  OCP MX v1.0 conformance audit: `DOCS_MX/OCP_CONFORMANCE.md` matrix; packer switched to the
+  spec-§6.3 algorithm (`mxint8_pack.h`); microxcaling external diff (`tools/mxint8_external_diff.py`
+  + `mxint8_host_ref.c`, `.mx-venv`) green over 8000 blocks incl. the divergence band; −128
+  corner cases + new deviation **D3** (RES-OPT 20-bit mesh raw envelope; all-±128 block is one
+  LSB out); policy v1.1 (deviations D1/D2/D3). **P3 multi-tile (I/J>1) done 2026-06-13** —
+  policy **Appendix A** (padded pow-2 C-tile pitch, tiled A/B scale layout, DIM<32
+  phase-adjacent issue order, logical-block-keyed accumulate bit); RTL: CONFIG_MXINT8/LOOP_WS
+  geometry plumbing, ExecuteController chained drain walk `(kp,tile_i,tile_j,kb)` + tag-vs-walk
+  assert, LoopMatmul padded pitch + DIM<32 reorder (zero buffer growth); SW: lifted wrapper
+  guard + B-scale repack + `tiled_matmul_mxint8` outer tiler + fence-before-config. Two latent
+  bugs fixed (phase-keyed acc bit; RESET_K drain race). Verified bit-exact: `mxint8_multitile`
+  5/5 on DIM=32 and DIM=16, dim16 single-tile 6/6, full §4 matrix green both DIMs, stock
+  re-elaborates bit-identical. `run_regression.sh`/`run_perf.sh` switched to `run-binary-fast`
+  (run-binary's +verbose throttled sims ~1000×). Next: **Stage B** DIM generalization {4,8,16,32}
+  (N-phase RTL refactor + DIM=8/4 configs), then **P2** counters/synthesis.
 
 ---
 
@@ -102,9 +115,10 @@ Add a new test: drop `bareMetalC/<name>.c`, add `<name>` to the `tests` list in
 | `DOCS_MX/PLAN_MX_UPDATED.md` | **Execution plan of record** (phases P0–P11: artifact hygiene → OCP conformance → counters → multi-tile → wide-acc → OS/transpose gate → eval → FireSim/FPGA → MXINT16 → paper). Keep its §5 log updated as steps complete. |
 | `DOCS_MX/RESEARCH_PLAN.md` | **Research/publication plan** — TRETS thesis, contributions C1–C5, 2026 landscape, baselines/workloads/ablations, timeline, risks. |
 | `DOCS_MX/PLAN_MX.md` | Historical log of the completed R0–R3/S1–S3/RES-OPT/bug-fix work (superseded for forward planning; its §12 log is the verification evidence base). |
-| `mxint8_policy.md` | **Frozen numerical contract** (E8M0 decode, block scale `2^(eA+eB-12)`, rounding, saturation, `0xff` reject). Do not change semantics without updating this (v1.1 spec-mapping lands in P1). |
-| `DOCS_MX/OCP_Microscaling Formats (MX).pdf` | **OCP MX v1.0 spec — the normative standard** (P1 conformance matrix maps to it). |
-| `DOCS_MX/PLAN_TEST.md` | Golden-model/verification test plan (external cross-check spec → P1's `mxint8_external_diff.py`). |
+| `mxint8_policy.md` | **Frozen numerical contract, v1.1** (spec-§6.3 packing, E8M0 decode, block scale `2^(eA+eB-12)`, rounding, saturation, deviations D1/D2/D3). Do not change semantics without updating this. |
+| `DOCS_MX/OCP_Microscaling Formats (MX).pdf` | **OCP MX v1.0 spec — the normative standard.** |
+| `DOCS_MX/OCP_CONFORMANCE.md` | **Clause-by-clause conformance matrix** (P1): every normative clause → project behavior → CONFORM / DEVIATION / N.A.; audit findings incl. the fixed pre-P1 packer divergence band. |
+| `DOCS_MX/PLAN_TEST.md` | Golden-model/verification test plan (external cross-check spec, implemented as P1's `tools/mxint8_external_diff.py`). |
 | `DOCS_MX/mxint8_gemmini_plan_updated.pdf` | April 2026 detailed research plan (historical input; superseded). |
 | `DOCS_MX/research-report 4.md` | April 2026 critical review (historical input; superseded). |
 | `CODING_STYLES/scala_coding_style.md` | Chisel/Scala style (mandatory). |
@@ -164,7 +178,7 @@ block spans two physical K phases; held scales + two-phase accumulation — the 
 ## 5. The plan
 
 `DOCS_MX/PLAN_MX_UPDATED.md` is authoritative for new work. Phases: **P0** artifact
-hygiene (commit/tag the WIP) → **P1** OCP MX v1.0 conformance audit → **P2** AutoCounters +
+hygiene (commit/tag the WIP) ✓ → **P1** OCP MX v1.0 conformance audit ✓ → **P2** AutoCounters +
 synthesis deltas → **P3** multi-tile I/J>1 → **P4** wide-accumulator option → **P5**
 OS/transpose single case (hard 4-week gate) → **P6** eval harness/baselines → **P7**
 FireSim VCU118 → **P8** Nexys Video prototype → **P9** accuracy sanity → **P10** MXINT(d)/

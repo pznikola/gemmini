@@ -295,7 +295,7 @@ format. MXINT16 is an "MX-consistent generalization" within the spec's §5.1 fra
 | `mxint8_matmul_partial` (6 cases) | PASS | — |
 | `mxint8_tiled` (wrapper K=32 → K=64 BtB) | PASS | — |
 | `mxint8_btb` (+ probe build) | PASS | — |
-| `mxint8_multitile` (from P3) | PASS | PASS |
+| `mxint8_multitile` (P3: probes, non-pow2 J, edges, random K, tiler J-chunk) | PASS | PASS |
 | `tools/mxint8_external_diff.py --sweep` (microxcaling oracle, host `.mx-venv`) | host | host |
 | Stock `GemminiRocketConfig` elaboration | 0 firtool errors | — |
 
@@ -351,3 +351,40 @@ documented in the §5 log with the reason.
   semantics unchanged). Regression: full §4 matrix green (corner re-verified in isolation
   post-fix; a consolidated re-run was launched). Nothing committed or pushed (user
   commits). **Next: P2 (counters + synthesis numbers).**
+- **2026-06-13 — P3 multi-tile loop support (I/J > 1): RTL-verified bit-exact on DIM=32
+  and DIM=16.** Implements the policy **Appendix A** contract (added this session). (1)
+  **Geometry plumbing:** `CONFIG_MXINT8` rs2 now carries `{log2_Jp, J_tiles, I_tiles}`
+  to the ExecuteController (`Controller.scala`); `LOOP_WS` rs1 bit 3 (MX-loop marker) +
+  bits 7:4 (`log2_Jp`) carry the padded-pitch info to the loop unroller — stock software
+  leaves those bits zero, so non-MX loops are unaffected. (2) **ExecuteController:** the
+  scalar drain counter `mx_matmul` is replaced by a chained wrapping walk
+  `(kp, tile_i, tile_j, kb)` that recovers each drained output's tile/block/phase from the
+  strict drain order; the A/B scale reads are now tile-addressed (A row `tile_i*DIM+row`,
+  B row `b_scale_base + kb*Jp + tile_j`); a per-row **assert cross-checks the
+  tag-derived tile** (sliced from the C acc-row under the padded pitch) against the walk —
+  it stayed silent across every multi-tile drain. (3) **LoopMatmul:** Execute/StC/LdD use
+  the **padded power-of-two C-tile pitch** (`i<<log2_Jp | j`) under `req.mx`; the
+  accumulate bit is now keyed by the **logical block** (`k >> log2(phases)`), not the
+  physical k phase (**latent bug fixed** — phase-keying would accumulate block-0's
+  committed write into stale data at DIM<32). (4) **DIM<32 multi-tile reorder
+  (Appendix A.3):** for `req.mx && I*J>1` the unroller issues the `mx_block_size/DIM`
+  physical phases of one (tile, block) **back-to-back** (`kb` slowest … `kp` fastest), so
+  the existing single-tile `mx_raw_half` buffer suffices unchanged — **zero buffer growth**
+  (the literature-corroborated decision: exact-integer MX needs a raw-partial hold, kept
+  minimal at `DIM²×20b`; B is re-preloaded per episode, COMPUTE_AND_FLIP each phase).
+  (5) **Software:** `gemmini.h` wrapper lifts the I==J==1 guard, validates the
+  Appendix-A.5 envelope, repacks B scales to the tiled image (`mxint8_repack_b_scales_tiled`,
+  dense fast path when already contiguous), and **fences before `CONFIG_MXINT8`** (latent
+  hazard fixed — the front-end RESET_K pulse would otherwise race in-flight drains across
+  tiler invocations). New `tiled_matmul_mxint8` outer tiler chunks M/N/K to the envelope
+  with `ex_accumulate` K-continuation. New registered test `bareMetalC/mxint8_multitile.c`
+  (per-tile nonzero-signature probes, non-pow-2 J, partial edges all dims, random
+  multi-block K, outer-tiler J-chunk case). **Verification (all `run-binary-fast`):**
+  DIM=32 multitile 5/5 PASS; DIM=16 multitile 5/5 PASS (incl. the 2-J-chunk tiler case —
+  first hardware exercise of the reorder); DIM=16 single-tile `mxint8_matmul_dim16` 6/6
+  PASS (reorder inert at I=J=1); full §4 matrix green on both DIMs; stock
+  `GemminiRocketConfig` re-elaborates (622 .sv, 0 firtool errors — bit-identical).
+  **Perf note:** found+fixed that `make run-binary` (+verbose → spike-dasm pipe) throttled
+  sims ~1000× (66M cycles/9.5h); `run_regression.sh`/`run_perf.sh` switched to
+  `run-binary-fast`. Mesh/PE untouched. Nothing committed (user commits). **Next: Stage B
+  (DIM generalization {4,8,16,32}: N-phase RTL refactor + DIM=8/4 configs).**
