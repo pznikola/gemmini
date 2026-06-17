@@ -48,7 +48,13 @@ class MXScaleLoadController[T <: Data, U <: Data, V <: Data](config: GemminiArra
   val deps_t = new Bundle {
     val rob_id = UInt(log2Up(reservation_station_entries).W)
   }
-  val maxBytesInMatRequest = DIM * mx_scale_row_bits / 8
+  // A single scale mvin loads up to `rows` rows of at most DIM scale bytes each. With
+  // multi-tile (policy Appendix A) the B-scale image is `k_blocks*Jp` rows and the A
+  // image is `I*DIM` rows — both up to the half-region bound mx_scale_sp_entries/2, well
+  // above DIM. Size the command tracker's byte counter for the whole region (rows up to
+  // mx_scale_sp_entries, DIM bytes/row) so `bytes_to_read = rows*cols` never overflows
+  // (the DIM^2 bound here truncated large multi-tile B mvins to 0 at DIM < 16).
+  val maxBytesInMatRequest = mx_scale_sp_entries * DIM
   val cmd_tracker = Module(new DMACommandTracker(nCmds, maxBytesInMatRequest, deps_t))
 
   val actual_stride = Mux(stride === 0.U, cols, stride)

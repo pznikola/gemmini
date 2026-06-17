@@ -219,7 +219,9 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
   require(!mx_enabled || weightType.isInstanceOf[SInt], "MXINT8 v1 requires signed INT8 weight payloads")
   require(!mx_enabled || accType.isInstanceOf[SInt], "MXINT8 v1 requires a signed integer accumulator")
   require(!mx_enabled || dataflow == Dataflow.WS, "MXINT8 v1 is scoped to weight-stationary Gemmini configs")
-  require(!mx_enabled || (DIM == 16 || DIM == 32), "MXINT8 v1 is staged for DIM=16 and DIM=32 only")
+  require(!mx_enabled || (isPow2(DIM) && DIM >= 4 && DIM <= mx_block_size),
+    "MXINT8 supports power-of-two DIM in [4, mx_block_size]; DIM>mx_block_size needs " +
+    "mesh-internal per-block accumulation (see DOCS_MX/DIM64_FEASIBILITY.md)")
   require(!mx_enabled || mx_scale_sp_entries > 0, "MX scale SRAM capacity must provide at least one scale row")
 
   //==========================================================================

@@ -61,3 +61,45 @@ class GemminiMXINT8DIM16RocketConfig extends Config(
   new freechips.rocketchip.rocket.WithNHugeCores(1) ++
   new chipyard.config.WithSystemBusWidth(128) ++
   new chipyard.config.AbstractConfig)
+
+class GemminiMXINT8DIM8RocketConfig extends Config(
+  new gemmini.DefaultGemminiConfig(gemmini.GemminiConfigs.mxint8DIM8Config) ++   // 8x8 MXINT8 (4-phase)
+  new freechips.rocketchip.rocket.WithNHugeCores(1) ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new chipyard.config.AbstractConfig)
+
+class GemminiMXINT8DIM4RocketConfig extends Config(
+  new gemmini.DefaultGemminiConfig(gemmini.GemminiConfigs.mxint8DIM4Config) ++   // 4x4 MXINT8 (8-phase)
+  new freechips.rocketchip.rocket.WithNHugeCores(1) ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new chipyard.config.AbstractConfig)
+
+// ------------------------------
+// Stock (non-MX) twins for fair stock-vs-MX comparison: byte-identical mesh/spad/acc to
+// the MX config at each DIM, mx_enabled=false. (GemminiRocketConfig above uses the base
+// defaultConfig and is NOT a fair DIM=16 twin — chipConfig has different capacities.)
+// ------------------------------
+
+class GemminiStockDIM32RocketConfig extends Config(
+  new gemmini.DefaultGemminiConfig(gemmini.GemminiConfigs.stockDIM32Config) ++  // 32x32 stock twin
+  new freechips.rocketchip.rocket.WithNHugeCores(1) ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new chipyard.config.AbstractConfig)
+
+class GemminiStockDIM16RocketConfig extends Config(
+  new gemmini.DefaultGemminiConfig(gemmini.GemminiConfigs.stockDIM16Config) ++  // 16x16 stock twin
+  new freechips.rocketchip.rocket.WithNHugeCores(1) ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new chipyard.config.AbstractConfig)
+
+class GemminiStockDIM8RocketConfig extends Config(
+  new gemmini.DefaultGemminiConfig(gemmini.GemminiConfigs.stockDIM8Config) ++   // 8x8 stock twin
+  new freechips.rocketchip.rocket.WithNHugeCores(1) ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new chipyard.config.AbstractConfig)
+
+class GemminiStockDIM4RocketConfig extends Config(
+  new gemmini.DefaultGemminiConfig(gemmini.GemminiConfigs.stockDIM4Config) ++   // 4x4 stock twin
+  new freechips.rocketchip.rocket.WithNHugeCores(1) ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new chipyard.config.AbstractConfig)

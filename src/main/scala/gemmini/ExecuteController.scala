@@ -149,6 +149,14 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val mx_k_lane_counter = if (mx_enabled) RegInit(0.U(32.W)) else 0.U(32.W)
   val mx_logical_block = (mx_k_lane_counter >> log2Ceil(mx_block_size)).asUInt
   val mx_second_half = if (mx_enabled && DIM < mx_block_size) mx_k_lane_counter(log2Ceil(mx_block_size) - 1) else false.B
+  // Phase index within the logical 32-block: mx_block_size/DIM physical phases per block
+  // (the lane counter advances by block_size = DIM per compute). Generalizes the DIM=16
+  // two-phase `mx_second_half` to any power-of-two DIM <= mx_block_size.
+  val mx_in_phase = if (mx_enabled && DIM < mx_block_size) {
+    mx_k_lane_counter(log2Ceil(mx_block_size) - 1, log2Ceil(DIM))
+  } else {
+    0.U
+  }
   val mx_compute_active = mx_enabled.B && mx_runtime_enabled && current_dataflow === Dataflow.WS.id.U
 
   val a_should_be_fed_into_transposer = Mux(current_dataflow === Dataflow.OS.id.U, !a_transpose, a_transpose)
@@ -746,25 +754,23 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       "MXINT8 execute path v1 supports untransposed WS GEMM only")
   }
 
-  // When the physical array is narrower than the logical MX block (DIM=16), one
-  // logical 32-element K block spans exactly two physical K phases. The lane
-  // counter advances by `block_size` (=DIM=16) per compute, so the logical block
-  // (`mx_k_lane_counter >> log2(mx_block_size)`) advances only every 32 lanes
-  // (two computes), and `mx_second_half` (`mx_k_lane_counter` bit log2(32)-1)
-  // strictly alternates first/second half. The two-phase BlockScaleUnit only
-  // buffers a single half (`mx_raw_half`), so this exactly-two-phases invariant
-  // is load-bearing.
+  // When the physical array is narrower than the logical MX block, one logical
+  // 32-element K block spans `mx_block_size/DIM` physical K phases. The lane counter
+  // advances by `block_size` (=DIM) per compute, so the logical block
+  // (`mx_k_lane_counter >> log2(mx_block_size)`) advances only every 32 lanes, and the
+  // phase index (`mx_in_phase`) cycles 0,1,..,N-1. The BlockScaleUnit accumulates the
+  // running raw-partial sum across the non-final phases into a single `DIM x DIM` buffer
+  // (`mx_raw_buf`), so the phases must arrive in strict 0..N-1 order — checked here.
   if (mx_enabled && DIM < mx_block_size) {
-    require(mx_block_size == 2 * block_size,
-      "MXINT8 DIM<block two-phase path assumes exactly two physical K phases per MX block")
-    val mx_phase_toggle = RegInit(false.B)
+    val mx_in_phases = mx_block_size / DIM
+    val mx_phase_ctr = RegInit(0.U(log2Ceil(mx_in_phases).W))
     when (mx_reset) {
-      mx_phase_toggle := false.B
+      mx_phase_ctr := 0.U
     } .elsewhen (control_state === compute && about_to_fire_all_rows &&
       (perform_single_mul || perform_mul_pre) && mx_compute_active) {
-      assert(mx_second_half === mx_phase_toggle,
-        "MXINT8 DIM<32: physical K phases must alternate first/second half (32-lane K block)")
-      mx_phase_toggle := !mx_phase_toggle
+      assert(mx_in_phase === mx_phase_ctr,
+        "MXINT8 DIM<32: physical K phases must arrive in strict 0..N-1 order per 32-lane block")
+      mx_phase_ctr := Mux(mx_phase_ctr === (mx_in_phases - 1).U, 0.U, mx_phase_ctr + 1.U)
     }
   }
 
@@ -1055,7 +1061,6 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     }
   }
   val mx_drain_block = mx_out_kb
-  val mx_out_second_half = if (mx_enabled && DIM < mx_block_size) mx_out_kp(0) else false.B
 
   // Scales for the currently-draining output: A exponent for this row, B exponent vector for
   // the N output columns (invalid is re-derived as `exp === 128`). Driven by the read-ahead
@@ -1133,15 +1138,20 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     // not 64 bits: a summed 32-lane block is <= 32*127^2 < 2^20. At DIM == mx_block_size one
     // physical phase is a whole logical block, so the buffer is never read/written and is
     // not instantiated at all.
-    val mx_raw_half = if (DIM < mx_block_size) {
+    val mx_raw_buf = if (DIM < mx_block_size) {
       Some(Reg(Vec(block_size, Vec(meshColumns, Vec(tileColumns,
         SInt(spatialArrayOutputType.getWidth.W))))))
     } else {
       None
     }
     val mx_resp_is_scaled = mesh_resp_valid && mesh_resp.tag.mx_enabled
-    val mx_dim16_first_half = (DIM < mx_block_size).B && mx_resp_is_scaled && !mx_out_second_half
-    val mx_dim16_second_half = (DIM < mx_block_size).B && mx_resp_is_scaled && mx_out_second_half
+    // Phase position within the logical block, recovered from the drain-order walk
+    // (`mx_out_kp`, mx_block_shift bits). For mx_block_size/DIM = N phases: phase 0 seeds
+    // the buffer, phases 1..N-2 accumulate into it (write suppressed), the last phase
+    // (all-ones) adds the buffer to the current partial, scales once, and writes the acc.
+    val mx_phase_first = if (DIM < mx_block_size) (mx_out_kp === 0.U) else true.B
+    val mx_phase_last = if (DIM < mx_block_size) mx_out_kp.andR else true.B
+    val mx_buffering = (DIM < mx_block_size).B && mx_resp_is_scaled && !mx_phase_last
 
     def roundRightNearestEven(value: SInt, shift: UInt): SInt = {
       val width = 64
@@ -1194,34 +1204,39 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     val mx_b_scale_invalid = VecInit(mx_set_b_exp.map(_ === 128.S(mx_scale_exp_bits.W)))
     val mx_b_scale_valid = mx_set_valid
 
-    // Only buffer the first half on a real, committed output row, mirroring the
-    // accumulator-write guards below. In weight-stationary mode the mesh also
-    // emits non-output cycles tagged mx_enabled (the multiply's garbage-addr
-    // output and pipeline bubbles); these have `rob_id.valid=false`, so they do
-    // not advance `output_counter` or raise `start_array_outputting`. Without
-    // this guard they re-store `mx_raw_half(0)` with zero between the two phases,
-    // so the second half reads 0 and only one 16-wide half reaches the
-    // accumulator (output = one half instead of the summed block).
+    // Accumulate the running raw-partial sum across the non-final phases, on real,
+    // committed output rows only (mirroring the accumulator-write guards below). In
+    // weight-stationary mode the mesh also emits non-output cycles tagged mx_enabled (the
+    // multiply's garbage-addr output and pipeline bubbles); these have
+    // `rob_id.valid=false`, so they do not advance `output_counter` or raise
+    // `start_array_outputting`. Without this guard they would re-store the buffer with
+    // zero between phases. Phase 0 seeds the buffer with its partial; later non-final
+    // phases add their partial to it. The running sum of up to 32 lanes is bounded by
+    // 32*127^2 < 2^19, so it fits the spatial-array output width (SInt(20)); the
+    // non-widening add stays at that width (the all-+/-128 corner is deviation D3).
     if (DIM < mx_block_size) {
-      when (mx_dim16_first_half && start_array_outputting && write_this_row) {
-        mx_raw_half.get(output_counter) := VecInit(mesh_resp.data.map(v =>
-          VecInit(v.map(_.asUInt.asSInt))))
+      when (mx_buffering && start_array_outputting && write_this_row) {
+        mx_raw_buf.get(output_counter) := VecInit(mesh_resp.data.zipWithIndex.map { case (col, colId) =>
+          VecInit(col.zipWithIndex.map { case (elem, tileId) =>
+            val raw_current = elem.asUInt.asSInt
+            Mux(mx_phase_first, raw_current,
+              mx_raw_buf.get(output_counter)(colId)(tileId) + raw_current)
+          })
+        })
       }
     }
 
-    mx_suppress_acc_write := mx_dim16_first_half
+    mx_suppress_acc_write := mx_buffering
     mx_acc_wdata := VecInit(mesh_resp.data.zipWithIndex.map { case (col, colId) =>
       VecInit(col.zipWithIndex.map { case (elem, tileId) =>
         val lane = colId * tileColumns + tileId
         val raw_current = elem.asUInt.asSInt
-        // Sum the two physical K phases of one logical block before a single scale
-        // application (DIM<block). The 20-bit half plus the 20-bit current partial use a
-        // widening add so the 21-bit block sum cannot wrap. At DIM == mx_block_size one
-        // phase is the whole block, so there is no buffered half to add.
+        // The accumulator is written only on the last phase (others are suppressed), where
+        // the buffer holds the sum of phases 0..N-2; add the final phase's partial, then
+        // apply the single block scale. At DIM == mx_block_size one phase is the whole
+        // block, so there is no buffer to add.
         val raw_block = if (DIM < mx_block_size) {
-          Mux(mx_dim16_second_half,
-            mx_raw_half.get(output_counter)(colId)(tileId) +& raw_current,
-            raw_current)
+          mx_raw_buf.get(output_counter)(colId)(tileId) +& raw_current
         } else {
           raw_current
         }
@@ -1232,7 +1247,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
     // Validate the scales only on real, committed output rows (not the WS bubble /
     // garbage-address cycles, which carry stale scale lanes).
-    when (mx_resp_is_scaled && !mx_dim16_first_half && start_array_outputting && write_this_row) {
+    when (mx_resp_is_scaled && !mx_buffering && start_array_outputting && write_this_row) {
       assert(mx_set_valid, "MXINT8 output reached BlockScaleUnit before its prefetched scale set was ready")
       assert(!a_invalid, "MXINT8 A scale vector contains invalid E8M0 scale")
       assert(!mx_b_scale_invalid.asUInt.orR, "MXINT8 B scale vector contains invalid E8M0 scale")

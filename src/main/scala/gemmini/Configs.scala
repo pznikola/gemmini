@@ -241,6 +241,19 @@ object GemminiConfigs {
     meshRows=32, meshColumns=32
   )
 
+  // Smaller-DIM twins of chipConfig (same 64KB/32KB capacities, so each stock-vs-MX pair
+  // at a given DIM is internally fair — the MX variant differs only by the scale sidecar).
+  val smallChipConfig = chipConfig.copy(tileRows=1, tileColumns=1, meshRows=8, meshColumns=8)
+  val tinyChipConfig  = chipConfig.copy(tileRows=1, tileColumns=1, meshRows=4, meshColumns=4)
+
+  // Stock (non-MX) twins with distinct params-header names, so the stock-vs-MX perf
+  // framework (DOCS_MX/scripts/run_perf.sh) can stage a per-DIM stock header alongside the
+  // MX one. Same mesh/capacities as the MX config at each DIM; mx_enabled stays false.
+  val stockDIM32Config = largeChipConfig.copy(headerFileName = "gemmini_params_stock_dim32.h")
+  val stockDIM16Config = chipConfig.copy(headerFileName = "gemmini_params_stock_dim16.h")
+  val stockDIM8Config  = smallChipConfig.copy(headerFileName = "gemmini_params_stock_dim8.h")
+  val stockDIM4Config  = tinyChipConfig.copy(headerFileName = "gemmini_params_stock_dim4.h")
+
   val mxint8DIM32Config = largeChipConfig.copy(
     mx_enabled = true,
     mx_block_size = 32,
@@ -257,6 +270,26 @@ object GemminiConfigs {
     mx_int_frac_bits = 6,
     mx_scale_sp_capacity = CapacityInKilobytes(8),
     headerFileName = "gemmini_params_mxint8_dim16.h"
+  )
+
+  // N-phase MXINT8 at DIM < 16 (mx_block_size/DIM physical phases per logical 32-block:
+  // 4 phases at DIM=8, 8 at DIM=4). Generalized from the verified DIM=16 two-phase path.
+  val mxint8DIM8Config = smallChipConfig.copy(
+    mx_enabled = true,
+    mx_block_size = 32,
+    mx_scale_bits = 8,
+    mx_int_frac_bits = 6,
+    mx_scale_sp_capacity = CapacityInKilobytes(8),
+    headerFileName = "gemmini_params_mxint8_dim8.h"
+  )
+
+  val mxint8DIM4Config = tinyChipConfig.copy(
+    mx_enabled = true,
+    mx_block_size = 32,
+    mx_scale_bits = 8,
+    mx_int_frac_bits = 6,
+    mx_scale_sp_capacity = CapacityInKilobytes(8),
+    headerFileName = "gemmini_params_mxint8_dim4.h"
   )
 
   val leanConfig = defaultConfig.copy(dataflow=Dataflow.WS, max_in_flight_mem_reqs = 64, acc_read_full_width = false, ex_read_from_acc = false, ex_write_to_spad = false, hardcode_d_to_garbage_addr = true)
