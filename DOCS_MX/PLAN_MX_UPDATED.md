@@ -286,22 +286,27 @@ format. MXINT16 is an "MX-consistent generalization" within the spec's §5.1 fra
 
 ## 4. Regression matrix (must be green after every phase)
 
-| Test | DIM=32 config | DIM=16 config |
-|---|---|---|
-| `mxint8_golden` | PASS | — |
-| `mxint8_matmul_dim32` (probe K=32 + random K=64) | PASS | — |
-| `mxint8_matmul_dim16` (probe, random K=32, xprobe K=64/128, random K=64/96) | — | PASS |
-| `mxint8_corner` (12 cases incl. the P1 −128 quartet) | PASS | — |
-| `mxint8_matmul_partial` (6 cases) | PASS | — |
-| `mxint8_tiled` (wrapper K=32 → K=64 BtB) | PASS | — |
-| `mxint8_btb` (+ probe build) | PASS | — |
-| `mxint8_multitile` (P3: probes, non-pow2 J, edges, random K, tiler J-chunk) | PASS | PASS |
-| `tools/mxint8_external_diff.py --sweep` (microxcaling oracle, host `.mx-venv`) | host | host |
-| Stock `GemminiRocketConfig` elaboration | 0 firtool errors | — |
+MX configs span DIM ∈ {32, 16, 8, 4} after Stage B (phases/block = 32/DIM = 1/2/4/8).
+
+| Test | DIM=32 | DIM=16 | DIM=8 | DIM=4 |
+|---|---|---|---|---|
+| `mxint8_golden` (host golden unit test) | PASS | — | — | — |
+| `mxint8_matmul_dim32` (probe K=32 + random K=64) | PASS | — | — | — |
+| `mxint8_matmul_dim16` (probe, random K=32, xprobe K=64/128, random K=64/96) | — | PASS | — | — |
+| `mxint8_matmul_nphase` (DIM-agnostic: probe + random K=1..4 blocks) | PASS | PASS | PASS | PASS |
+| `mxint8_corner` (12 cases incl. the P1 −128 quartet) | PASS | — | — | — |
+| `mxint8_matmul_partial` (6 cases) | PASS | — | — | — |
+| `mxint8_tiled` (wrapper K=32 → K=64 BtB) | PASS | — | — | — |
+| `mxint8_btb` (+ probe build) | PASS | — | — | — |
+| `mxint8_multitile` (P3: probes, non-pow2 J, edges, random K, tiler J-chunk) | PASS | PASS | PASS | PASS |
+| `tools/mxint8_external_diff.py --sweep` (microxcaling oracle, host `.mx-venv`) | host | host | host | host |
+| Stock `GemminiRocketConfig` elaboration | 0 firtool errors | — | — | — |
 
 Plus per-phase additions (transpose/OS test from P5; MXINT16 suite from P10). Bit-exact
 vs `mxint8_golden.h` always; any legitimate re-baseline (P1 packer change) must be
-documented in the §5 log with the reason.
+documented in the §5 log with the reason. The DIM-agnostic tests (`mxint8_matmul_nphase`,
+`mxint8_multitile`) are staged per DIM by the matching `gemmini_params_mxint8_dim<D>.h`
+header (run via `run_regression.sh --dims=32,16,8,4`).
 
 ---
 
@@ -388,3 +393,68 @@ documented in the §5 log with the reason.
   sims ~1000× (66M cycles/9.5h); `run_regression.sh`/`run_perf.sh` switched to
   `run-binary-fast`. Mesh/PE untouched. Nothing committed (user commits). **Next: Stage B
   (DIM generalization {4,8,16,32}: N-phase RTL refactor + DIM=8/4 configs).**
+- **2026-06-15 — Stage B: full-rate DIM generalization to {4, 8, 16, 32}: RTL-verified
+  bit-exact at all four DIMs.** (1) **Require lifted** (`GemminiConfigs.scala`):
+  `require(!mx_enabled || (isPow2(DIM) && DIM >= 4 && DIM <= mx_block_size))` replaces the
+  DIM∈{16,32} gate; DIM>mx_block_size stays out of scope (mesh-internal per-block accum —
+  see `DOCS_MX/DIM64_FEASIBILITY.md`, written this stage). (2) **N-phase RTL refactor**
+  (`ExecuteController.scala`): the DIM=16 two-phase BlockScaleUnit path generalized to
+  N = mx_block_size/DIM phases (1/2/4/8 at DIM=32/16/8/4). Input side: `mx_in_phase`
+  (the lane-counter bits `[log2(mx_block_size)-1 : log2(DIM)]`) + an N-state wrapping
+  phase-order assert replace the boolean toggle and the `mx_block_size==2*block_size`
+  require. Drain side: the `mx_raw_half` first/second-half logic becomes a running
+  accumulation — phase 0 seeds the `DIM×DIM×20b` buffer (renamed `mx_raw_buf`), phases
+  1..N-2 add into it (acc write suppressed), the last phase (`mx_out_kp.andR`) adds the
+  buffer to the current partial, scales once, writes the acc. Buffer width unchanged
+  (running sum ≤ 32·127² < 2^19; D3 envelope unchanged). **Verified as a pure refactor
+  first:** DIM=32 (1-phase) full suite 8/8 and DIM=16 (2-phase) 3/3 re-green before any new
+  DIM existed. (3) **New configs** (`Configs.scala`, `chipyard/GemminiConfigs.scala`):
+  `smallChipConfig`/`tinyChipConfig` (8×8 / 4×4, same 64KB/32KB caps as chipConfig) +
+  `mxint8DIM8Config`/`mxint8DIM4Config`; chipyard wrappers `GemminiMXINT8DIM8/4RocketConfig`
+  and fair stock twins `GemminiStockDIM32/16/8/4RocketConfig` (= the MX configs' mesh/caps
+  with `mx_enabled=false`, via `DefaultGemminiConfig(<cfg>)`). Params headers
+  (`gemmini_params_mxint8_dim8/4.h`) are **auto-emitted** by elaboration
+  (`Controller.scala:29`), DIM-scaled correctly (BANK_ROWS 2048/4096, ACC_ROWS 1024/2048,
+  MX_SCALE_SP_ROWS 1024/2048). (4) **New DIM-agnostic test** `bareMetalC/mxint8_matmul_nphase.c`
+  (reads DIM/MX_BLOCK_SIZE from the staged header; probe + random K=1..4 blocks); runs at
+  all four DIMs. `run_regression.sh` refactored to a per-DIM loop (`--dims=32,16,8,4`).
+  **Latent bug found + fixed (`MXScaleLoadController.scala`):** `maxBytesInMatRequest` was
+  sized `DIM²`, assuming a scale mvin loads ≤ DIM rows × DIM bytes; the **multi-tile
+  B-scale image has `k_blocks·Jp` rows**, so at DIM=4 a 32-byte mvin overflowed the
+  `log2Up(DIM²+1)=5`-bit `bytes_to_read` counter and wrapped to 0, tripping the "scale mvin
+  must load >0 bytes" assert. (DIM=8 escaped by coincidence: B was exactly 8×8=DIM²;
+  DIM=16/32 never exceeded DIM² in the tested shapes — a P3-introduced latent bug surfaced
+  only at DIM<8 multi-tile.) Fixed by sizing the counter for the whole scale region
+  (`mx_scale_sp_entries·DIM`); width-only, behaviorally inert at DIM=16/32 (re-verified).
+  **Verification:** stock DIM=8/4 elaborate (B0); full §4 matrix **green across all four
+  DIMs** (DIM=32 8 tests, DIM=16 3, DIM=8/4 nphase+multitile each) + stock elaboration,
+  via `run_regression.sh --dims=32,16,8,4` → OVERALL: PASS. Mesh/PE untouched. Nothing
+  committed (user commits). **Next: Stage C (stock-vs-MX comparison framework: run the
+  perf + OOC-synthesis scripts to produce the report).**
+- **2026-06-17 — Stage C: stock-vs-MX comparison framework — scripts written + perf path
+  validated end-to-end on DIM=16 (synthesis deferred).** Deliverables in `DOCS_MX/scripts/`:
+  `mx_bench.c` (one source, header-staged: stock→`tiled_matmul_auto`, MX→`tiled_matmul_mxint8`;
+  `read_cycles()` timing; sampled-row golden gate; `MXBENCH,...` machine-readable lines),
+  `run_perf.sh` (per-DIM stock/MX pairs → `results/perf.csv`), `run_synth.sh` + `synth_ooc.tcl`
+  (Vivado 2022.2 OOC of the `Gemmini` tile, part xc7a200tsbg484-1), `make_report.py`
+  (perf+synth CSVs → `results/comparison_report.md`). Fair-twin stock configs got distinct
+  header names (`stockDIM{32,16,8,4}Config` → `gemmini_params_stock_dim<D>.h`). **Live result
+  (DIM=16, squares 64³/128³/256³, all PASS bit-exact):** stock 5420/11639/76914 cyc
+  (18/70/85% util) vs MX 6053/35829/268721 cyc (16/22/24%). The MX `tiled_matmul_mxint8`
+  also passed I=J=16 multi-tile at 256³ (16 chunked invocations) — independent confirmation
+  that multi-tile scales beyond the P3 test's ≤3-tile cases. **Key finding:** MX is bit-exact
+  but slower, and the gap grows with tile count (1.12× at 1 chunk → 3.1× at 4 → 3.5× at 16) —
+  the signature of per-invocation fixed cost, not per-MAC cost. Root cause is the software
+  tiler: each chunk does `gemmini_fence()` + reconfigure + scale reload, fully serializing
+  (vs stock's pipelined `tiled_matmul_auto`). The fence is forced by `CONFIG_MXINT8` being a
+  non-RS-ordered front-end instruction whose `RESET_K` resets the drain-order walk. The MX
+  *datapath* itself is stock-rate (combinational BlockScaleUnit, same mesh passes). **Fix
+  (future work):** make the MX scale config RS-ordered so chunks pipeline like stock, and
+  load all block scales once per problem. **Harness limits hit + worked around:** /tmp full
+  from a foreign workflow (cleared, with user OK); large static `.bss` (N≥3072) stalls the
+  Verilator load, so the suite is capped to square shapes (BERT-3072 dropped); `mx_bench`'s
+  MX path needed explicit ex/st/ld config (the loop unroller, unlike `tiled_matmul_auto`,
+  does not self-configure). **Deferred:** Vivado OOC synthesis (scripts ready, needs the
+  Vivado env), and the DIM=32/8/4 perf sweeps (framework is DIM-parameterized). Nothing
+  committed (user commits). **Next: P2 (AutoCounters + the synthesis numbers via run_synth.sh),
+  then P4+.**

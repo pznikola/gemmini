@@ -34,6 +34,7 @@ for arg in "$@"; do
   case "$arg" in
     --build-sims) BUILD_SIMS=1 ;;
     --dims) prev="--dims" ;;
+    --dims=*) DIMS="${arg#--dims=}" ;;
     *) echo "unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
@@ -48,7 +49,9 @@ java -version 2>&1 | grep -q 'version "20' \
 [ -x "$FIRTOOL" ] || { echo "FATAL: pinned firtool missing at $FIRTOOL"; exit 1; }
 
 mkdir -p "$RESULTS_DIR"
-[ -f "$CSV" ] || echo "config,impl,dim,M,N,K,cycles,macs,ideal_cycles,util_pct,result" > "$CSV"
+# Write the header if the file is missing or empty (a truncated/reset CSV must still
+# get a header, or make_report.py's DictReader mis-keys the first data row).
+[ -s "$CSV" ] || echo "config,impl,dim,M,N,K,cycles,macs,ideal_cycles,util_pct,result" > "$CSV"
 
 FAILED=0
 

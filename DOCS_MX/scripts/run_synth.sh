@@ -55,7 +55,8 @@ set -u
 command -v vivado >/dev/null || { echo "FATAL: vivado not on PATH after settings64.sh"; exit 1; }
 
 mkdir -p "$SYNTH_DIR"
-[ -f "$CSV" ] || echo "config,part,clk_ns,lut,ff,bram36,dsp,wns_ns,fmax_mhz" > "$CSV"
+# Write the header if the file is missing or empty (so a reset CSV still parses).
+[ -s "$CSV" ] || echo "config,part,clk_ns,lut,ff,bram36,dsp,wns_ns,fmax_mhz" > "$CSV"
 
 FAILED=0
 for cfg in $CONFIGS; do

@@ -42,8 +42,24 @@ publication plan), then `mxint8_policy.md` (the frozen numerical contract).
   bugs fixed (phase-keyed acc bit; RESET_K drain race). Verified bit-exact: `mxint8_multitile`
   5/5 on DIM=32 and DIM=16, dim16 single-tile 6/6, full §4 matrix green both DIMs, stock
   re-elaborates bit-identical. `run_regression.sh`/`run_perf.sh` switched to `run-binary-fast`
-  (run-binary's +verbose throttled sims ~1000×). Next: **Stage B** DIM generalization {4,8,16,32}
-  (N-phase RTL refactor + DIM=8/4 configs), then **P2** counters/synthesis.
+  (run-binary's +verbose throttled sims ~1000×). **Stage B DIM generalization {4,8,16,32} done
+  2026-06-15** — N-phase RTL refactor (DIM=16 two-phase BlockScaleUnit generalized to
+  N=32/DIM phases: running raw-partial accumulation in `mx_raw_buf`, N-state phase-order
+  assert; verified as a pure refactor at DIM=32/16 first); require lifted to
+  `isPow2(DIM) && 4<=DIM<=mx_block_size`; new `GemminiMXINT8DIM8/4RocketConfig` + fair stock
+  twins `GemminiStockDIM{32,16,8,4}RocketConfig`; params headers auto-emitted; new
+  DIM-agnostic `mxint8_matmul_nphase` test; **fixed a P3 latent bug** (`MXScaleLoadController`
+  `maxBytesInMatRequest` was `DIM²`, overflowing the byte counter for the multi-tile
+  `k_blocks·Jp`-row B-scale image at DIM<8 → sized to the whole scale region). Full §4 matrix
+  green across all four DIMs + stock elaboration (`run_regression.sh --dims=32,16,8,4`).
+  DIM>32 is document-only (`DOCS_MX/DIM64_FEASIBILITY.md`). **Stage C comparison framework:
+  scripts done + perf path validated on DIM=16 2026-06-17** (`DOCS_MX/scripts/`: `mx_bench.c`,
+  `run_perf.sh`, `run_synth.sh`+`synth_ooc.tcl`, `make_report.py`; fair stock twins
+  `GemminiStockDIM{32,16,8,4}RocketConfig`). DIM=16 squares stock-vs-MX all bit-exact;
+  finding: MX is correct but the v1 software tiler serializes multi-tile GEMMs behind a
+  per-chunk config fence (gap grows with tile count: 1.1×→3.5×), fixable by an RS-ordered MX
+  config — the MX *datapath* is stock-rate. Deferred: Vivado OOC synthesis (scripts ready,
+  needs Vivado env) + DIM=32/8/4 perf sweeps. Next: **P2** AutoCounters + synthesis numbers.
 
 ---
 

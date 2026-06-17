@@ -18,25 +18,38 @@ TESTS_DIR="$REPO/generators/gemmini/software/gemmini-rocc-tests"
 BUILD_DIR="$TESTS_DIR/build/bareMetalC"
 TIMEOUT_CYCLES=300000000
 
-DIM32_CONFIG="GemminiMXINT8DIM32RocketConfig"
-DIM16_CONFIG="GemminiMXINT8DIM16RocketConfig"
 STOCK_CONFIG="GemminiRocketConfig"
 
 DIM32_TESTS="mxint8_golden mxint8_matmul_dim32 mxint8_corner mxint8_matmul_partial \
-             mxint8_tiled mxint8_btb mxint8_multitile"
-DIM16_TESTS="mxint8_matmul_dim16 mxint8_multitile"
+             mxint8_tiled mxint8_btb mxint8_multitile mxint8_matmul_nphase"
+DIM16_TESTS="mxint8_matmul_dim16 mxint8_multitile mxint8_matmul_nphase"
+# DIM=8/4 (Stage B) reuse the same DIM-agnostic tests; run them via --dim8/--dim4 once
+# their sims are built (see B3). mxint8_matmul_nphase covers 4- and 8-phase blocks.
+DIM8_TESTS="mxint8_multitile mxint8_matmul_nphase"
+DIM4_TESTS="mxint8_multitile mxint8_matmul_nphase"
 
 BUILD_SIMS=0
-RUN_DIM32=1
-RUN_DIM16=1
+DIMS="32 16"          # default: the two original DIMs; pass --dims to widen/narrow
 for arg in "$@"; do
   case "$arg" in
     --build-sims)  BUILD_SIMS=1 ;;
-    --dim32-only)  RUN_DIM16=0 ;;
-    --dim16-only)  RUN_DIM32=0 ;;
+    --dim32-only)  DIMS="32" ;;
+    --dim16-only)  DIMS="16" ;;
+    --dims=*)      DIMS="${arg#--dims=}"; DIMS="${DIMS//,/ }" ;;
     *) echo "unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
+
+mx_config_for_dim() { echo "GemminiMXINT8DIM${1}RocketConfig"; }
+tests_for_dim() {  # echo the test list for a given DIM
+  case "$1" in
+    32) echo "$DIM32_TESTS" ;;
+    16) echo "$DIM16_TESTS" ;;
+    8)  echo "$DIM8_TESTS" ;;
+    4)  echo "$DIM4_TESTS" ;;
+    *)  echo "" ;;
+  esac
+}
 
 # --- Environment (JDK trap: system JDK 21 shadows conda JDK 20) --------------------
 # env.sh's conda activate scripts reference variables that are unset on first entry,
@@ -81,23 +94,15 @@ run_one() {  # run_one <Config> <test>
     > "/tmp/mx_run_$1_$2.log" 2>&1
 }
 
-# --- DIM=32 -------------------------------------------------------------------------
-if [ "$RUN_DIM32" -eq 1 ]; then
-  [ "$BUILD_SIMS" -eq 1 ] && { build_sim "$DIM32_CONFIG"; record "sim:$DIM32_CONFIG" $?; }
-  build_tests_for_dim 32; record "build:tests-dim32" $?
-  for t in $DIM32_TESTS; do
-    note "DIM32 $t"; run_one "$DIM32_CONFIG" "$t"; record "dim32:$t" $?
+# --- Per-DIM MX matrix --------------------------------------------------------------
+for d in $DIMS; do
+  cfg="$(mx_config_for_dim "$d")"
+  [ "$BUILD_SIMS" -eq 1 ] && { build_sim "$cfg"; record "sim:$cfg" $?; }
+  build_tests_for_dim "$d"; record "build:tests-dim$d" $?
+  for t in $(tests_for_dim "$d"); do
+    note "DIM$d $t"; run_one "$cfg" "$t"; record "dim$d:$t" $?
   done
-fi
-
-# --- DIM=16 -------------------------------------------------------------------------
-if [ "$RUN_DIM16" -eq 1 ]; then
-  [ "$BUILD_SIMS" -eq 1 ] && { build_sim "$DIM16_CONFIG"; record "sim:$DIM16_CONFIG" $?; }
-  build_tests_for_dim 16; record "build:tests-dim16" $?
-  for t in $DIM16_TESTS; do
-    note "DIM16 $t"; run_one "$DIM16_CONFIG" "$t"; record "dim16:$t" $?
-  done
-fi
+done
 
 # --- Stock elaboration gate (0 firtool errors expected) -----------------------------
 note "Stock elaboration ($STOCK_CONFIG)"
