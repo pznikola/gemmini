@@ -458,3 +458,28 @@ header (run via `run_regression.sh --dims=32,16,8,4`).
   Vivado env), and the DIM=32/8/4 perf sweeps (framework is DIM-parameterized). Nothing
   committed (user commits). **Next: P2 (AutoCounters + the synthesis numbers via run_synth.sh),
   then P4+.**
+- **2026-06-18 — Performance root-cause investigation (measure-first): the slowdown is the
+  per-chunk scale-DMA/fence prologue, NOT the DIM<32 reorder.** Full attribution in
+  `DOCS_MX/PERF_ANALYSIS.md`. Added the **DIM=32 perf pair** (`gemmini_params_stock_dim32.h`
+  created — the stock twin was missing — = the MX dim32 header with `MX_ENABLED 0`): MX is
+  **5.26× slower at 256³ even at DIM=32**, where there is no phase split and no reorder —
+  refuting the initial "lost weight-reuse" hypothesis. Instrumented `mx_bench` with the
+  CounterFile (`MXCOUNT` lines): execute-hazard counters (overlap/preload/cq-block/flush)
+  are **flat zero** and DMA-wait counters (`ld_wait`/`st_wait`) are **zero** — so it is
+  neither compute-bound, hazard-bound, nor memory-latency-bound. **Controlled experiment
+  (DIM32, 64³, single chunk):** MX and stock move **byte-for-byte identical** traffic
+  (rd 32768 / wr 16384, both `full_C`) with identical exe/ld/st-active and rs-active, yet
+  MX = 5713 vs stock = 3826 cyc (1.49×); the delta is **invisible to all main-path
+  counters** (incl. `rd_bytes`, identical despite MX's extra E8M0 scale loads → the
+  `mx_scale_load_controller` DMA is uncounted). The MX/stock ratio tracks **software-chunk
+  count** (1→2→8 ⇒ 1.49×→3.3×→5.26×), not MACs. ⇒ Root cause = the per-chunk, MX-only,
+  **serialized prologue** (`gemmini_fence()` + `CONFIG_MXINT8` reconfigure + separate
+  scale-load DMA) issued before the matmul and **not overlapped**, recurring once per
+  `gemmini_loop_ws_mxint8` invocation; stock runs one fenceless pipelined loop and
+  amortizes. **Fix ordering (revised):** (P1) fewer/larger chunks in the tiler [SW,
+  zero-RTL]; (P2) load scales once per problem when resident; (P3, primary RTL) make
+  `CONFIG_MXINT8` RS-ordered + overlap scale-DMA so the fence is removed and chunks
+  pipeline; (P4, secondary, DIM<32-only) revisit the weight-reuse reorder, and if needed
+  keep cross-phase partials in **accumulator SRAM, not a 20 Kb FF buffer**. No RTL changed
+  this session (investigation only). Mesh/PE untouched. Nothing committed (user commits).
+  **Next: P1 (tiler chunk-size enlargement) + re-measure with the MXCOUNT counters.**
