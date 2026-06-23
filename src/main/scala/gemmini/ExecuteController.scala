@@ -50,6 +50,11 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
         val i_tiles = Input(UInt(16.W))
         val j_tiles = Input(UInt(16.W))
         val log2_jp = Input(UInt(4.W))
+        // K-block count of the loop (policy Appendix A / P3): lets the drain-order walk
+        // wrap mx_out_kb to 0 at the loop boundary and self-cycle per loop with no reset
+        // signal, so consecutive fenceless chunks pipeline. 0 = legacy (no wrap; the RESET_K
+        // pulse still re-zeroes the walk), preserving v1 behavior bit-for-bit.
+        val k_blocks = Input(UInt(16.W))
         val read_a = Decoupled(new MXScaleSRAMReadReq(mx_scale_sp_entries))
         val read_b = Decoupled(new MXScaleSRAMReadReq(mx_scale_sp_entries))
         val resp_a = Flipped(Valid(new MXScaleSRAMReadResp(DIM, mx_scale_exp_bits)))
@@ -1031,20 +1036,30 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val mx_i_tiles = if (mx_enabled) io.mx.get.i_tiles else 1.U
   val mx_j_tiles = if (mx_enabled) io.mx.get.j_tiles else 1.U
   val mx_log2_jp = if (mx_enabled) io.mx.get.log2_jp else 0.U
+  val mx_k_blocks = if (mx_enabled) io.mx.get.k_blocks else 0.U
 
   val mx_out_kp = if (mx_enabled && mx_phases > 1) RegInit(0.U(mx_block_shift.W)) else 0.U(1.W)
   val mx_out_i = if (mx_enabled) RegInit(0.U(16.W)) else 0.U
   val mx_out_j = if (mx_enabled) RegInit(0.U(16.W)) else 0.U
   val mx_out_kb = if (mx_enabled) RegInit(0.U((mx_scale_addr_bits + 1).W)) else 0.U
+  // P3: loop parity toggled at each loop boundary (kb wrap). Selects the scale-SRAM
+  // ping-pong half so a fenceless next chunk's scale mvin cannot clobber this chunk's
+  // still-draining scales. Stays 0 in legacy (k_blocks == 0) mode.
+  val mx_out_parity = if (mx_enabled) RegInit(0.U(1.W)) else 0.U(1.W)
 
   // Combinational next-state of the walk, used by the one-cycle-ahead scale reads.
   val mx_kp_wrap = if (mx_phases > 1) mx_out_kp === (mx_phases - 1).U else true.B
   val mx_i_wrap = mx_kp_wrap && (mx_out_i + 1.U === mx_i_tiles)
   val mx_j_wrap = mx_i_wrap && (mx_out_j + 1.U === mx_j_tiles)
+  // P3: when the loop's K-block count is known (k_blocks != 0), wrap kb to 0 at the loop
+  // boundary so the walk self-cycles per loop with no reset signal and the read-ahead lands
+  // on the next loop's first scales. k_blocks == 0 keeps the legacy non-wrapping behavior.
+  val mx_kb_wrap = (mx_k_blocks =/= 0.U) && mx_j_wrap && (mx_out_kb + 1.U === mx_k_blocks)
   val mx_next_kp = Mux(mx_kp_wrap, 0.U, mx_out_kp + 1.U)
   val mx_next_i = Mux(!mx_kp_wrap, mx_out_i, Mux(mx_i_wrap, 0.U, mx_out_i + 1.U))
   val mx_next_j = Mux(!mx_i_wrap, mx_out_j, Mux(mx_j_wrap, 0.U, mx_out_j + 1.U))
-  val mx_next_kb = mx_out_kb + mx_j_wrap
+  val mx_next_kb = Mux(mx_kb_wrap, 0.U, mx_out_kb + mx_j_wrap)
+  val mx_next_parity = mx_out_parity ^ mx_kb_wrap
 
   if (mx_enabled) {
     when (mx_reset) {
@@ -1052,12 +1067,14 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       mx_out_i := 0.U
       mx_out_j := 0.U
       mx_out_kb := 0.U
+      mx_out_parity := 0.U
     } .elsewhen (mesh_resp_valid && mesh_resp.last &&
         mesh_resp.tag.rob_id.valid && mesh_resp.tag.mx_enabled) {
       if (mx_phases > 1) { mx_out_kp := mx_next_kp }
       mx_out_i := mx_next_i
       mx_out_j := mx_next_j
       mx_out_kb := mx_next_kb
+      mx_out_parity := mx_next_parity
     }
   }
   val mx_drain_block = mx_out_kb
@@ -1079,6 +1096,14 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     val b_scale_base = (mx_scale_sp_entries / 2).U(mx_scale_addr_bits.W)
     val draining = mesh_resp_valid && mesh_resp.tag.rob_id.valid
 
+    // P3 scale ping-pong: each loop-parity owns half of its scale region (A: low/high of
+    // [0, entries/2); B: low/high of [entries/2, entries)). The read uses the *next* parity
+    // at a loop boundary (mesh_resp.last) to line up with the next loop's first output, same
+    // as mx_a_tile uses mx_next_i. parity == 0 (legacy / k_blocks==0) adds 0 -> addresses
+    // are bit-for-bit unchanged.
+    val mx_rd_parity = Mux(draining && mesh_resp.last, mx_next_parity, mx_out_parity)
+    val mx_scale_pp_off = (mx_rd_parity << log2Ceil(mx_scale_sp_entries / 4)).asUInt
+
     // Read one cycle ahead: address the output that will drain *next* -- the next row within
     // this matmul, or row 0 of the next matmul (with the *next* walk indices) at a matmul
     // boundary, holding the address during bubbles. The SyncReadMem response one cycle later
@@ -1089,13 +1114,13 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       wrappingAdd(output_counter, 1.U, mesh_resp.total_rows), output_counter)
     val mx_a_tile = Mux(draining && mesh_resp.last, mx_next_i, mx_out_i)
     mx.read_a.valid := mx_runtime_enabled
-    mx.read_a.bits.addr := (mx_a_tile << log2Ceil(DIM)).asUInt + mx_a_row
+    mx.read_a.bits.addr := (mx_a_tile << log2Ceil(DIM)).asUInt + mx_a_row + mx_scale_pp_off
 
     // B-scale row (Appendix A.2): b_scale_base + kb*Jp + tile_j.
     val mx_b_row = (mx_out_kb << mx_log2_jp).asUInt + mx_out_j
     val mx_b_row_next = (mx_next_kb << mx_log2_jp).asUInt + mx_next_j
     mx.read_b.valid := mx_runtime_enabled
-    mx.read_b.bits.addr := b_scale_base +
+    mx.read_b.bits.addr := b_scale_base + mx_scale_pp_off +
       Mux(draining && mesh_resp.last, mx_b_row_next, mx_b_row)
 
     assert(!(mx.read_a.valid && !mx.read_a.ready), "MXScaleSRAM A read port must accept scale vector reads")

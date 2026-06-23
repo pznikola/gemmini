@@ -281,6 +281,9 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   val mx_loop_i_tiles = RegInit(1.U(16.W))
   val mx_loop_j_tiles = RegInit(1.U(16.W))
   val mx_loop_log2_jp = RegInit(0.U(4.W))
+  // K-block count of the next MX loop (P3): 0 = legacy (drain walk does not wrap kb; the
+  // RESET_K pulse re-zeroes it), nonzero lets the walk self-cycle per loop (fenceless).
+  val mx_loop_k_blocks = RegInit(0.U(16.W))
 
   // Wire up controllers to ROB
   reservation_station.io.alloc.valid := false.B
@@ -396,6 +399,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     ex_mx.i_tiles := mx_loop_i_tiles
     ex_mx.j_tiles := mx_loop_j_tiles
     ex_mx.log2_jp := mx_loop_log2_jp
+    ex_mx.k_blocks := mx_loop_k_blocks
     scale_sram.io.read_a <> ex_mx.read_a
     scale_sram.io.read_b <> ex_mx.read_b
     ex_mx.resp_a := scale_sram.io.resp_a
@@ -570,14 +574,17 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
           mx_scale_stride_a := unrolled_cmd.bits.cmd.rs2
         }
       } .elsewhen (enable) {
-        // Plain enable sub-command: rs2 = {log2_Jp[39:32], J_tiles[31:16], I_tiles[15:0]}.
-        // Zero fields decay to the single-tile shape (1 tile, dense pitch).
+        // Plain enable sub-command: rs2 = {K_blocks[55:40], log2_Jp[35:32], J_tiles[31:16],
+        // I_tiles[15:0]}. Zero fields decay to the single-tile shape (1 tile, dense pitch);
+        // K_blocks == 0 keeps the legacy non-wrapping walk (RESET_K still re-zeroes it).
         val cfg_i_tiles = unrolled_cmd.bits.cmd.rs2(15, 0)
         val cfg_j_tiles = unrolled_cmd.bits.cmd.rs2(31, 16)
         val cfg_log2_jp = unrolled_cmd.bits.cmd.rs2(35, 32)
+        val cfg_k_blocks = unrolled_cmd.bits.cmd.rs2(55, 40)
         mx_loop_i_tiles := Mux(cfg_i_tiles === 0.U, 1.U, cfg_i_tiles)
         mx_loop_j_tiles := Mux(cfg_j_tiles === 0.U, 1.U, cfg_j_tiles)
         mx_loop_log2_jp := cfg_log2_jp
+        mx_loop_k_blocks := cfg_k_blocks
         assert(cfg_j_tiles <= (1.U << cfg_log2_jp).asUInt || cfg_j_tiles === 0.U,
           "CONFIG_MXINT8: J_tiles must fit the padded power-of-two pitch 2^log2_Jp")
       }
