@@ -358,3 +358,87 @@ to the working per-row load (RTL at the bit-exact P3 baseline).
 near stock). The RTL is in a clean, bit-exact, working state. The fix is well-scoped DMA
 work (option 1 first) but needs a focused pass — 8 surface attempts were spent localizing,
 not fixing.**
+
+---
+
+## CORRECTION (2026-06-24): the scale-load "root cause" above is WRONG — overturned by direct instrumentation
+
+The "per-row scale load = 72%" conclusion was a **misattribution**. The skip-scales
+experiment removed the scale *commands*, which removed not just DMA time but the whole
+drain-time scale path and its serialization — and that latter part was the real cost. Two
+dedicated CounterFile events (`MX_SCALE_DMA_ACTIVE_CYCLE`, `MX_SCALE_DMA_SOLO_CYCLE`,
+CounterFile.scala 45/46) wired to `mx_scale_load_controller.io.busy` measured the scale
+load directly. At **256³ DIM32**: `mxscale_active = 4,738 cycles = 2.6%` (solo = same). **The
+scale-load DMA is NOT the bottleneck.** The burst/pipeline plan in `DMA_FIX_PLAN.md` is moot.
+
+### What the data actually shows (256³ DIM32, mx_bench, run-binary-fast)
+
+| signal | stock | MX | note |
+|---|---|---|---|
+| cycles | 37,101 | 180,725 | MX 4.9× |
+| util_pct | 44% | 9% | |
+| exe_active (control_state==compute) | 20,233 (55%) | 24,717 (14%) | **same absolute compute** |
+| rdma_active / wdma_active | 24,043 / 28,532 | 15,942 / 19,906 | MX *lower* — not DMA |
+| mxscale_active | n/a | 4,738 (2.6%) | scale DMA is tiny |
+| **spadA_wait / spadB_wait** | 13,777 (37%, B) | **154,755 / 153,923 (~86%)** | **11× worse, both operands** |
+| exe_flush | — | **0** | not a flush/fence-state stall |
+| overlap_haz / preload_haz / ctrlq_block | — | **0 / 0 / 0** | not a stock hazard or queue block |
+| a_garbage / b_garbage | — | 1.6% / ~100% | WS COMPUTE_AND_STAY: A streamed, B reused |
+| loopmm_active | 35,050 (94%) | 41,694 (23%) | unroller stalled — RS full |
+| rs_full / rs_active | 97% / — | 99% / 30% | RS jammed with un-retiring matmuls |
+
+### TRUE root cause: MX matmuls do not pipeline — single drain-walk + one BlockScaleUnit
+
+Compute (`exe_active`) is the *same* absolute work as stock; it is just spread over 4.9×
+the cycles because the mesh feed starves ~86% (both A and B), with **no flush state, no
+stock hazard, no queue block, and negligible DMA**. The `ExecuteController.scala:786` comment
+states the limit outright: *"the chunks still do not overlap — single drain walk + one
+BlockScaleUnit."* Each MX matmul's output retires slowly through the one drain-order
+walk + one BlockScaleUnit, so the next matmul cannot enter/feed the mesh until the current
+one finishes draining (stock overlaps next-compute with prior-drain). Matmuls pile up in the
+RS (full 99%), the unroller stalls (loopmm 23%), and the mesh sits starved. The stock
+`overlap_haz` reads 0 because that hazard is a RAW-on-accumulator check, a different
+mechanism from this MX-custom drain serialization.
+
+### Fix locus (next): the MX drain/retirement path in ExecuteController (mesh stays DO-NOT-TOUCH)
+Let consecutive matmuls overlap — the next matmul's compute/feed must proceed while the
+current matmul's output is still draining+scaling (pipeline or otherwise free up the
+drain-walk / scale-apply so it stops gating mesh matmul entry). Exact gating signal
+(`mesh.io.req.ready` on the first row vs `dataX_valid`) to be confirmed with one direct
+`mesh.io.req.ready`/drain-occupancy counter in the next sim rebuild.
+
+The instrumentation that produced this lives in `mx_bench.c` (runtime-reconfigurable counter
+slots) + the two new CounterFile events; all of it is observation-only and bit-exact.
+
+### Confirmed gate (2026-06-24, 2nd rebuild with serialization counters)
+
+Four direct counters (CounterFile.scala 47-50, wired in ExecuteController) partition the 86%
+stall. **256³ DIM32:** `wait_cmd = 155,941 (86%)`, `enq_not_ready = 0`, `req_stall = 0`,
+`draining = 16,384 (9%) = exactly ideal_cycles`, `exe_active = 24,725 (14%)`.
+
+Reading:
+- **Not** drain-throughput bound: the mesh drains exactly the minimum 16,384 output rows and
+  is busy only 9% — it is efficient and idle most of the time.
+- **Not** matmul-entry (`req_stall=0`, `mesh.io.req.ready` never the gate) and **not** the
+  control-signal queue (`enq_not_ready=0`).
+- **Not** a RAW hazard: both stock and MX derive from `largeChipConfig` with
+  `ex_read_from_acc=false, ex_write_to_spad=false` (Configs.scala 234-235), so
+  `raw_hazards_are_impossible=true` (ExecuteController.scala:265) for both.
+- The 86% is the execute controller in `waiting_for_cmd` while the **reservation station
+  does not issue the next EX matmul** (RS is full at 99%, so commands exist — they are
+  dependency-blocked). The EX→EX dependency (ReservationStation.scala:338) clears only when
+  the prior matmul **completes** (`io.completed` = `mesh_resp.last`, ExecuteController:1352).
+
+This reproduces at 64³ (a single chunk, 94% wait_cmd) and on **independent** output tiles,
+so the serialization is **global**, not per-C-tile and not per-chunk: the **single MX
+drain-order walk + one BlockScaleUnit** drain output tiles one at a time in walk order, so
+every matmul's completion is gated behind the prior tile's drain through the one shared walk.
+Stock has no such walk — outputs drain freely as they exit the mesh and completions fire
+independently, so matmuls pipeline (stock util 44-55% vs MX 9-14%).
+
+### Fix target (confirmed): pipeline the MX output/drain so completions don't serialize
+Let independent output tiles drain/complete without waiting in a single global walk — either
+track multiple in-flight drains, or decouple `io.completed` from the global walk position so
+the RS can issue the next matmul while the prior tile is still scaling/writing. Mesh stays
+DO-NOT-TOUCH; the change is in the ExecuteController MX drain-walk / BlockScaleUnit feed.
+Bit-exactness vs `mxint8_golden.h` is the gate.

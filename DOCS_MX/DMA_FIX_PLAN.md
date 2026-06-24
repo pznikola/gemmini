@@ -1,3 +1,10 @@
+> **SUPERSEDED (2026-06-24).** Direct instrumentation overturned the premise of this plan:
+> the scale-load DMA is only **2.6%** of the 256³ runtime, not 72%. Do **not** implement the
+> burst. The true bottleneck is **MX matmul serialization** (single drain-walk + one
+> BlockScaleUnit ⇒ consecutive matmuls don't pipeline ⇒ mesh feed starves ~86%). See the
+> "CORRECTION (2026-06-24)" section at the end of `PERF_ANALYSIS.md`. This file is kept only
+> as a record of the (correct) analysis of the scale-load path itself.
+
 # MXINT8 scale-load DMA fix — batch the per-row mvin into one strided burst
 
 ## 1. Problem (proven, not guessed)
