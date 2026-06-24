@@ -1403,6 +1403,14 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   io.counter.connectEventSignal(CounterEvent.SCRATCHPAD_D_WAIT_CYCLE,
     !(!cntl.d_fire || mesh.io.d.fire || !mesh.io.d.ready) && !cntl.d_read_from_acc)
 
+  // MX serialization diagnostics (observation-only; partition the ~86% mesh-feed stall).
+  io.counter.connectEventSignal(CounterEvent.MX_DBG_WAIT_CMD_CYCLE, control_state === waiting_for_cmd)
+  io.counter.connectEventSignal(CounterEvent.MX_DBG_ENQ_NOT_READY_CYCLE, !mesh_cntl_signals_q.io.enq.ready)
+  io.counter.connectEventSignal(CounterEvent.MX_DBG_REQ_STALL_CYCLE,
+    mesh_cntl_signals_q.io.deq.valid && cntl.first && !mesh.io.req.ready)
+  io.counter.connectEventSignal(CounterEvent.MX_DBG_DRAINING_CYCLE,
+    mesh_resp_valid && mesh_resp.tag.rob_id.valid)
+
   if (use_firesim_simulation_counters) {
     val ex_flush_cycle = control_state === flushing || control_state === flush
     val ex_preload_haz_cycle = cmd.valid(0) && DoPreloads(0) && cmd.valid(1) && raw_hazard_pre

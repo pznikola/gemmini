@@ -519,6 +519,11 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   counters.io.event_io.connectEventSignal(CounterEvent.MAIN_ST_EX_CYCLES, incr_st_ex_cycles)
   counters.io.event_io.connectEventSignal(CounterEvent.MAIN_LD_ST_EX_CYCLES, incr_ld_st_ex_cycles)
 
+  // MX scale-load diagnostics: is the scale load on the critical path, or overlapped?
+  val mx_scale_busy = mx_scale_load_controller.io.busy
+  counters.io.event_io.connectEventSignal(CounterEvent.MX_SCALE_DMA_ACTIVE_CYCLE, mx_scale_busy)
+  counters.io.event_io.connectEventSignal(CounterEvent.MX_SCALE_DMA_SOLO_CYCLE, mx_scale_busy && !ex_controller.io.busy)
+
   // Issue commands to controllers
   // TODO we combinationally couple cmd.ready and cmd.valid signals here
   // when (compressed_cmd.valid) {

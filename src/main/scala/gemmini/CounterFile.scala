@@ -70,7 +70,24 @@ object CounterEvent {
   val LOOP_MATMUL_ACTIVE_CYCLES = 43
   val TRANSPOSE_PRELOAD_UNROLLER_ACTIVE_CYCLES = 44
 
-  val n = 45
+  // MX scale-load diagnostics (mx_enabled only; inert otherwise).
+  // MX_SCALE_DMA_ACTIVE: scale-load controller busy (DMA in flight or command pending).
+  // MX_SCALE_DMA_SOLO:   scale-load busy WHILE the execute pipeline is idle => the scale
+  //                      load is on the critical path (not overlapped with compute).
+  val MX_SCALE_DMA_ACTIVE_CYCLE = 45
+  val MX_SCALE_DMA_SOLO_CYCLE = 46
+
+  // MX serialization diagnostics (observation-only; partition the ~86% mesh-feed stall).
+  // WAIT_CMD: execute controller in waiting_for_cmd (starved for an EX command from the RS).
+  // ENQ_NOT_READY: the mesh control-signal queue can't accept (gates scratchpad read issue).
+  // REQ_STALL: a new matmul's first row is ready but mesh.io.req.ready is low (matmul entry blocked).
+  // DRAINING: the mesh is emitting a committed output row (drain/retirement in progress).
+  val MX_DBG_WAIT_CMD_CYCLE = 47
+  val MX_DBG_ENQ_NOT_READY_CYCLE = 48
+  val MX_DBG_REQ_STALL_CYCLE = 49
+  val MX_DBG_DRAINING_CYCLE = 50
+
+  val n = 51
 }
 
 object CounterExternal {
