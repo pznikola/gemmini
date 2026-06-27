@@ -79,15 +79,50 @@ object CounterEvent {
 
   // MX serialization diagnostics (observation-only; partition the ~86% mesh-feed stall).
   // WAIT_CMD: execute controller in waiting_for_cmd (starved for an EX command from the RS).
-  // ENQ_NOT_READY: the mesh control-signal queue can't accept (gates scratchpad read issue).
-  // REQ_STALL: a new matmul's first row is ready but mesh.io.req.ready is low (matmul entry blocked).
-  // DRAINING: the mesh is emitting a committed output row (drain/retirement in progress).
   val MX_DBG_WAIT_CMD_CYCLE = 47
-  val MX_DBG_ENQ_NOT_READY_CYCLE = 48
-  val MX_DBG_REQ_STALL_CYCLE = 49
-  val MX_DBG_DRAINING_CYCLE = 50
 
-  val n = 51
+  // Phase-0b DAE-inversion partition (repurposed codes 48/49/50/54; observation-only).
+  // The 6-bit counter-config field caps event codes at 63 and all 0..63 are taken, so these
+  // reuse codes whose original ENQ_NOT_READY/REQ_STALL/DRAINING/HOLD_NOT_DRAIN signals were
+  // already measured (~0 / ideal) and are no longer needed. They now attribute the
+  // EX-issue stall to in-flight MX scale-mvins (the decoupled-access-execute inversion: a
+  // matmul's dep on a scale-mvin clears only on the scale DMA's COMPLETION, RS:400/499).
+  // EX_BLOCKED_ON_SCALE:  an unissued EX entry is dep-blocked with >=1 dep on a live is_mx_scale load.
+  // EX_BLOCKED_SCALE_ONLY: same, and the scale dep is its ONLY blocker (relaxing it frees the entry).
+  // EX_BLOCKED_NONSCALE:  an unissued EX entry is dep-blocked by some non-scale dep (other gate).
+  val MX_EX_BLOCKED_ON_SCALE_CYCLE = 48
+  val MX_EX_BLOCKED_SCALE_ONLY_CYCLE = 49
+  val MX_EX_BLOCKED_NONSCALE_CYCLE = 50
+
+  // Phase-0 gate partition (split the 86% waiting_for_cmd; observation-only).
+  // NO_CMD: in waiting_for_cmd with NO command presented (RS not issuing => upstream gate).
+  // CMD_BLOCKED: in waiting_for_cmd WITH a command that can't act (config/hazard barrier).
+  // MATMUL_IN_PROGRESS: mesh holds >=1 matmul tag.
+  val MX_DBG_NO_CMD_CYCLE = 51
+  val MX_DBG_CMD_BLOCKED_CYCLE = 52
+  val MX_DBG_MATMUL_IN_PROGRESS_CYCLE = 53
+  // Code 54 repurposed (was HOLD_NOT_DRAIN): EX pool empty => unroller is not delivering
+  // matmuls (idle or stalled on ld_ahead/upstream), a distinct cause from a dep-blocked pool.
+  val MX_EX_POOL_EMPTY_CYCLE = 54
+
+  // RS-internal partition (why has the RS no issuable EX command?). Observation-only.
+  // EX_READY: an EX entry is ready (deps clear) but not yet issued (issue-handshake gate).
+  // EX_BLOCKED: an EX entry is unissued and dependency-blocked (dependency gate).
+  // EX_INFLIGHT: an EX entry is issued but not yet completed (completion-latency gate).
+  // EX_POOL_FULL: the EX entry pool is full. LD_INFLIGHT: a load is issued-not-complete.
+  val MX_DBG_EX_READY_CYCLE = 55
+  val MX_DBG_EX_BLOCKED_CYCLE = 56
+  val MX_DBG_EX_INFLIGHT_CYCLE = 57
+  val MX_DBG_EX_POOL_FULL_CYCLE = 58
+  val MX_DBG_LD_INFLIGHT_CYCLE = 59
+
+  // RS LD/ST pool composition: which pool actually fills the RS and throttles the unroller.
+  val MX_DBG_LD_POOL_FULL_CYCLE = 60
+  val MX_DBG_LD_BLOCKED_CYCLE = 61
+  val MX_DBG_ST_POOL_FULL_CYCLE = 62
+  val MX_DBG_ST_INFLIGHT_CYCLE = 63
+
+  val n = 64
 }
 
 object CounterExternal {

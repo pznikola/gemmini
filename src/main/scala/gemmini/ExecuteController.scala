@@ -1405,11 +1405,15 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
   // MX serialization diagnostics (observation-only; partition the ~86% mesh-feed stall).
   io.counter.connectEventSignal(CounterEvent.MX_DBG_WAIT_CMD_CYCLE, control_state === waiting_for_cmd)
-  io.counter.connectEventSignal(CounterEvent.MX_DBG_ENQ_NOT_READY_CYCLE, !mesh_cntl_signals_q.io.enq.ready)
-  io.counter.connectEventSignal(CounterEvent.MX_DBG_REQ_STALL_CYCLE,
-    mesh_cntl_signals_q.io.deq.valid && cntl.first && !mesh.io.req.ready)
-  io.counter.connectEventSignal(CounterEvent.MX_DBG_DRAINING_CYCLE,
-    mesh_resp_valid && mesh_resp.tag.rob_id.valid)
+
+  // Phase-0 gate partition: split the waiting_for_cmd time and observe mesh tag occupancy.
+  // (Codes 48/49/50/54 repurposed for the RS-side DAE-inversion partition; wired in
+  // ReservationStation.scala. EX_POOL_EMPTY=54 lives there too.)
+  io.counter.connectEventSignal(CounterEvent.MX_DBG_NO_CMD_CYCLE,
+    (control_state === waiting_for_cmd) && !cmd.valid(0))
+  io.counter.connectEventSignal(CounterEvent.MX_DBG_CMD_BLOCKED_CYCLE,
+    (control_state === waiting_for_cmd) && cmd.valid(0))
+  io.counter.connectEventSignal(CounterEvent.MX_DBG_MATMUL_IN_PROGRESS_CYCLE, matmul_in_progress)
 
   if (use_firesim_simulation_counters) {
     val ex_flush_cycle = control_state === flushing || control_state === flush
