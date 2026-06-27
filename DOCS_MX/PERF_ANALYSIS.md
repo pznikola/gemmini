@@ -442,3 +442,63 @@ track multiple in-flight drains, or decouple `io.completed` from the global walk
 the RS can issue the next matmul while the prior tile is still scaling/writing. Mesh stays
 DO-NOT-TOUCH; the change is in the ExecuteController MX drain-walk / BlockScaleUnit feed.
 Bit-exactness vs `mxint8_golden.h` is the gate.
+
+---
+
+## ★ DEFINITIVE ROOT CAUSE (2026-06-26/27) — host-side B-scale repack = 84% of runtime ★
+### (supersedes BOTH the scale-DMA theory AND the drain-walk theory above)
+
+Two more hypotheses were tested and **refuted by measurement before building either fix**:
+
+- **Drain-walk / "Fix B" (tag-addressed scales, retire the walk) is a NO-OP.** The drain walk
+  (`mx_out_i/j/kb/parity`) is provably equal to the mesh response tag (the existing assert at
+  `ExecuteController.scala:1292-1295` guarantees `mx_out_i===mx_tag_ti`, etc.), and it never
+  gates issue or mesh feed (the control FSM returns to `waiting_for_cmd` after feeding without
+  waiting for drain). Reading scales from the tag vs the walk yields the same scale at the same
+  cycle. The "single drain walk + one BlockScaleUnit" attribution above was wrong.
+- **Scale-mvin completion dependency (DAE inversion) is NOT the gate.** Counter
+  `MX_EX_BLOCKED_ON_SCALE` = **0** at all sizes — a matmul's dependency on its scale-mvins never
+  blocks EX issue.
+
+### What the counters actually show (mx_bench, GemminiMXINT8DIM32, all PASS)
+`no_cmd ≈ ex_pool_empty ≈ 82-85%`: the RS EX pool is empty — the matmul unroller isn't
+delivering. `ld_blocked=0`, `cmd_blocked≈1%`, mesh busy (`matmul_in_progress`) only 11→16%.
+Stock baseline keeps the unroller configured ~94% and the mesh ~69% busy. DMA localization:
+`load_active`/`rdma_active`/`scale_dma` all <9%, `tlb_miss=0` — **not** DMA-bound. The
+accelerator is starved by the **CPU**.
+
+### CPU-cost localization (timers around the per-chunk host work) — the smoking gun
+| shape | total cyc | **repack_cyc** | issue_cyc | repack % |
+|-------|-----------|----------------|-----------|----------|
+| 64³   | 5,952     | 2,513          | 45        | 42%      |
+| 128³  | 26,688    | 20,947         | 210       | 78%      |
+| 256³  | 181,703   | **152,234**    | 1,480     | **84%**  |
+
+`mxint8_repack_b_scales_tiled` (gemmini.h) — a scalar host loop that re-tiles the dense
+B-scales into the padded (kb,tile_j) image — is essentially the **entire** slowdown. Gemmini
+instruction *issue* is <1%. It runs because mx_bench passes dense B-scales (stride N=256) and
+each chunk spans 128 cols, so the direct-DMA path is skipped; worse, the same (kb,j) scales are
+re-tiled for **every i-chunk** (≈4× redundant at 256³), at ~19 cyc/element on the in-order Rocket.
+
+### Conclusion: MXINT8 hardware is competitive with stock
+**MX 256³ minus the repack = 181,703 − 152,234 ≈ 29.5k cycles — FASTER than stock's 35.2k.**
+The MX datapath is fine; the measured ~5× was one host software loop. (Note this also means
+the DIM=32 mx_bench numbers in the "Data" table above are dominated by the repack, not the mesh.)
+
+### Fix (implemented, correct-by-construction; gemmini.h)
+Per-(j-chunk,k-chunk) B-scale tile cache (`g_mx_btile_cache`/`g_mx_btile_valid` +
+`mx_btile_cache[]` in `tiled_matmul_mxint8`): repack each tile **once** and reuse across the
+i-sweep, plus a branchless repack loop. Direct callers (the bit-exact tests) pass NULL → the
+legacy per-chunk path, byte-identical, so bit-exactness is structurally preserved. Expected MX
+256³ → ~30-37k ≈ stock; further hoisting the (now one-time) tiling fully offline (static weight
+scales) → ~29.5k < stock.
+
+### Validation status: blocked by the latent fast-sim hang (NOT the fix)
+End-to-end in-sim validation is blocked by the project's pre-existing latent X-prop hang: on the
+fast-init sim, every post-edit binary hangs at the boot banner (layout-sensitive; my edits are
+functionally identical, finite, in-bounds; 16KB cache hangs same as 64KB). A `--x-initial 0`
+rebuild did NOT help and **broke the design** (the known-good baseline also hangs on zero-init —
+isolation-tested), so zero-init is a dead end; runtime `+verilator+rand+reset+0` had no effect.
+The headline is measured from completed runs and does not depend on this; the demonstration and
+the latent-hang root-cause are tracked as separate follow-up. (Current built sim artifact is the
+broken zero-init one — a default `make` rebuild restores fast-init.)
