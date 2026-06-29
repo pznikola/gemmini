@@ -4,6 +4,26 @@ Measured on Verilator, `run_perf.sh`, square shapes, run-binary-fast. Cycle coun
 `read_cycles()` around the timed region (scale+payload mvin + compute + mvout).
 `ideal = M·N·K/DIM²` (one MAC per PE per cycle). `util = ideal/cycles`.
 
+## ★ FIX VALIDATED in-sim (2026-06-29, GemminiMXINT8DIM32, run with `+loadmem`)
+
+The B-scale tile-cache fix (commit 30edd64) is **bit-exact and measured working**. Real
+`mx_bench` to clean `$finish` (`mx_bench: PASS`); all shapes bit-exact PASS:
+
+| shape | total cyc (post-fix) | repack_cyc | issue_cyc | pre-fix total / repack |
+|---|---:|---:|---:|---:|
+| 64³  | 5,397  | 1,492  | 70     | 5,952 / 2,513    |
+| 128³ | 15,402 | 5,028  | 2,385  | 26,688 / 20,947  |
+| 256³ | **74,484** | **22,452** | 16,197 | 181,703 / 152,234 |
+
+- **256³: repack 152,234 → 22,452 (6.8×); total 181,703 → 74,484 (2.4×), bit-exact.** The
+  redundant per-i-sweep re-tiling is gone (repacked once per (j,k) tile).
+- Still > stock (35,238 @ 256³): `no_cmd=61,503` ⇒ mesh starved 82% by host-side work =
+  residual **one-time** repack (22.5k, still in the timed region) + command issue (16.2k).
+  **Phase C** (offline pre-tile of the constant weight B-scales) removes the 22.5k → direct-DMA.
+- Validation methodology + the "there was never a hang" correction: `SIM_VALIDATION_NOTES.md`.
+- NOTE: the older DIM32 "Data" table below is **pre-fix** (repack-dominated) and superseded by
+  the row above for the cached path.
+
 ## Data
 
 ### DIM = 16 (2 phases/block, multi-tile reorder engaged)
