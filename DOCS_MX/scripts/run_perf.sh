@@ -82,8 +82,10 @@ run_bench() {  # run_bench <Config> <header-file>
   fi
 
   echo "=== $cfg: running mx_bench (this can take hours for the BERT shapes)"
+  # LOADMEM=1 preloads DRAM with the ELF (common.mk get_loadmem_flag), bypassing the slow TSI
+  # serial loader so mx_bench's large .bss does not gate boot time.
   make -C "$REPO/sims/verilator" CONFIG="$cfg" FIRTOOL_BIN="$FIRTOOL" run-binary-fast \
-    BINARY="$BUILD_DIR/mx_bench-baremetal" timeout_cycles=$TIMEOUT_CYCLES \
+    BINARY="$BUILD_DIR/mx_bench-baremetal" LOADMEM=1 timeout_cycles=$TIMEOUT_CYCLES \
     > "/tmp/mx_perf_run_$cfg.log" 2>&1
   local rc=$?
 

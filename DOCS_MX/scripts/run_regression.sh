@@ -89,8 +89,13 @@ build_sim() {  # build_sim <Config>
 }
 
 run_one() {  # run_one <Config> <test>
-  make -C "$REPO/sims/verilator" CONFIG="$1" run-binary-fast \
-    BINARY="$BUILD_DIR/$2-baremetal" timeout_cycles=$TIMEOUT_CYCLES \
+  # LOADMEM=1 preloads DRAM with the ELF (common.mk get_loadmem_flag), bypassing the slow TSI
+  # serial loader so boot time is footprint-independent (large-.bss binaries boot fast).
+  # FIRTOOL_BIN must be pinned even on the run path: if the sim is stale, run-binary-fast
+  # silently re-elaborates it, and a bare `firtool` from PATH (e.g. system LLVM 17) cannot
+  # parse a .fir emitted for the pinned 1.62.1/LLVM-18 dialect ("unexpected character").
+  make -C "$REPO/sims/verilator" CONFIG="$1" FIRTOOL_BIN="$FIRTOOL" run-binary-fast \
+    BINARY="$BUILD_DIR/$2-baremetal" LOADMEM=1 timeout_cycles=$TIMEOUT_CYCLES \
     > "/tmp/mx_run_$1_$2.log" 2>&1
 }
 

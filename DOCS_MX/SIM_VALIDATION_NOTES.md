@@ -101,7 +101,41 @@ shapes **bit-exact PASS**. The per-(j,k) tile cache (commit 30edd64) does exactl
   repack is a **one-time per-tile** cost still inside the timed region → **Phase C** (pre-tile
   the constant weight B-scales offline) removes it.
 
+## Phase C — offline B-scale pre-tile VALIDATED (2026-06-30)
+The constant weight B-scales are now pre-tiled **once, untimed**, removing the per-chunk repack
+from the timed GEMM entirely. API in `gemmini.h`: `mxint8_pretile_b_scales` (fills a caller
+buffer of `mx_JC*mx_KC` `MX_PRETILE_SLOT_ELEMS`-sized slots) + `tiled_matmul_mxint8_pretiled`
+(consumes it; `g_mx_btile_valid` forced true → no repack). `tiled_matmul_mxint8` is unchanged
+(forwards with NULL) so the bit-exact test callers are byte-identical. `mx_bench` uses the
+pretiled entry; pre-tile happens after `gen_inputs`, before `read_cycles()`.
+
+Measured (GemminiMXINT8DIM32, `+loadmem`, `mx_bench: PASS`, all shapes bit-exact):
+
+| shape | total cyc | repack_cyc | issue_cyc | result | cache-fix total | stock |
+|-------|-----------|------------|-----------|--------|-----------------|-------|
+| 64³   | 3,345     | **0**      | 69        | PASS   | 5,397           | —     |
+| 128³  | 10,102    | **0**      | 2,457     | PASS   | 15,402          | —     |
+| 256³  | **57,423**| **0**      | 21,258    | PASS   | 74,484          | 35,238|
+
+- repack fully eliminated; 256³ 74,484 → 57,423 (3.16× vs original 181,703). **Still 1.63×
+  stock** — residual is host command-issue (`issue_cyc=21,258`) + mesh feed (`no_cmd=59,287`,
+  mesh now 49% busy). Closing the rest needs fewer/cheaper commands or better feed overlap
+  (DO-NOT-TOUCH boundary). Open decision, not pursued yet.
+
+## Bit-exact gate GREEN across all DIMs (2026-06-30)
+`run_regression.sh --dims=32,16,8,4`: **DIM32 8/8, DIM16 3/3, DIM8 2/2, DIM4 2/2, stock
+elaborate — OVERALL PASS.** Phase C is bit-exact on the DIM<32 two-phase `mx_raw_buf` path too.
+
+**Toolchain trap found & fixed:** the first DIM16/8/4 pass FAILED with `firtool: unexpected
+character`. Cause: those sims were stale (older than the 06-27 gemmini bump), so
+`run-binary-fast` silently **re-elaborated** them — but `run_one()` did not pass `FIRTOOL_BIN`,
+so the rebuild used the system `/usr/local/bin/firtool` (**LLVM 17**) instead of the pinned
+1.62.1 (**LLVM 18**), which cannot parse the .fir dialect. DIM32 never rebuilt (its sim was
+current) so it was unaffected. Fix: `run_one` now passes `FIRTOOL_BIN="$FIRTOOL"`. Lesson: a
+sim "FAIL" that is actually a firtool parse error during an unintended rebuild ≠ a correctness
+failure — always check whether the sim re-elaborated.
+
 ## Next
-- Decide: cap mx_bench shapes (small `.bss`, plain flow) vs. keep 256³ behind `+loadmem`.
-- Bit-exact gate across DIM32→16→8→4 via `run_regression.sh` (the small tests already work).
-- Phase C: offline B-scale pre-tile to close the residual host-side gap.
+- Decide: bank Phase C (1.63× stock, bit-exact, deployment-realistic) vs. push host
+  command-issue / mesh-feed overlap toward stock parity (riskier; DO-NOT-TOUCH-adjacent).
+- Refresh the full stock-vs-MX matrix via `run_perf.sh` (the old DIM32 table is repack-dominated).

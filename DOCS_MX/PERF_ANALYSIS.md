@@ -4,6 +4,32 @@ Measured on Verilator, `run_perf.sh`, square shapes, run-binary-fast. Cycle coun
 `read_cycles()` around the timed region (scale+payload mvin + compute + mvout).
 `ideal = M·N·K/DIM²` (one MAC per PE per cycle). `util = ideal/cycles`.
 
+## ★★ PHASE C VALIDATED in-sim (2026-06-30, GemminiMXINT8DIM32, run with `+loadmem`)
+
+Offline B-scale pre-tiling (constant weights → pre-tile once, untimed). New API in
+`gemmini.h`: `mxint8_pretile_b_scales` fills a caller buffer with the per-(j,k) tiled images,
+and `tiled_matmul_mxint8_pretiled` consumes it so the **timed GEMM does ZERO repack**. The
+public `tiled_matmul_mxint8` signature is unchanged (forwards to `_impl(...,NULL)`), so the
+bit-exact test callers are byte-identical. `mx_bench: PASS`, all shapes bit-exact:
+
+| shape | total cyc (Phase C) | repack_cyc | issue_cyc | cache-fix total | original total | stock |
+|---|---:|---:|---:|---:|---:|---:|
+| 64³  | 3,345  | **0** | 69     | 5,397  | 5,952   | — |
+| 128³ | 10,102 | **0** | 2,457  | 15,402 | 26,688  | — |
+| 256³ | **57,423** | **0** | 21,258 | 74,484 | 181,703 | **35,238** |
+
+- **256³: repack 22,452 → 0; total 74,484 → 57,423 (1.30× beyond cache-fix; 3.16× vs original
+  181,703), bit-exact.** Mesh occupancy rose to 49% (`matmul_in_progress=28,091`, util 28%).
+- **Still 1.63× stock** (57,423 vs 35,238). With repack gone the residual is host-side command
+  issue + mesh feed: `issue_cyc=21,258`, `no_cmd=59,287` (EX controller still starved). The
+  `gemmini_loop_ws_mx` ROCC emission stalls on RoCC-queue/mesh-feed backpressure on the
+  in-order Rocket — closing the rest needs fewer/cheaper commands or better feed overlap, which
+  brushes the DO-NOT-TOUCH Mesh/PE/MeshWithDelays boundary. Open decision, not yet pursued.
+- **Bit-exact gate GREEN across all DIMs** (`run_regression.sh`): DIM32 8/8, DIM16 3/3, DIM8
+  2/2, DIM4 2/2, stock elaborate — OVERALL PASS. (DIM16/8/4 sims were rebuilt with the pinned
+  firtool 1.62.1; a stale-sim auto-rebuild had silently used system firtool 17 — fixed by
+  pinning `FIRTOOL_BIN` in `run_one`. See `SIM_VALIDATION_NOTES.md`.)
+
 ## ★ FIX VALIDATED in-sim (2026-06-29, GemminiMXINT8DIM32, run with `+loadmem`)
 
 The B-scale tile-cache fix (commit 30edd64) is **bit-exact and measured working**. Real

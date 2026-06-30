@@ -483,3 +483,21 @@ header (run via `run_regression.sh --dims=32,16,8,4`).
   keep cross-phase partials in **accumulator SRAM, not a 20 Kb FF buffer**. No RTL changed
   this session (investigation only). Mesh/PE untouched. Nothing committed (user commits).
   **Next: P1 (tiler chunk-size enlargement) + re-measure with the MXCOUNT counters.**
+- **2026-06-30 — Phase C (offline B-scale pre-tile) implemented & bit-exact-validated; perf
+  lands at 1.63× stock with repack eliminated.** New `gemmini.h` API: `mxint8_compute_geom`
+  (shared chunk geometry), `mxint8_pretile_b_scales` (fills a caller buffer with the per-(j,k)
+  tiled B-scale images, once, untimed), `tiled_matmul_mxint8_impl` (+ `b_pretiled` arg) and the
+  public `tiled_matmul_mxint8_pretiled` entry; `tiled_matmul_mxint8` signature unchanged
+  (forwards with NULL) so the bit-exact test callers are byte-identical. `mx_bench` calls the
+  pretiled entry (pre-tile after `gen_inputs`, before `read_cycles`). **Result (DIM32,
+  `+loadmem`, all PASS):** repack_cyc → **0** at every shape; 256³ 74,484 → **57,423** (3.16×
+  vs original 181,703), still **1.63× stock 35,238**. Residual is host command-issue
+  (`issue_cyc=21,258`) + mesh feed (`no_cmd=59,287`, mesh 49% busy) — the `gemmini_loop_ws_mx`
+  ROCC emission stalls on feed backpressure; closing further is DO-NOT-TOUCH-adjacent (open
+  decision, not pursued). **Bit-exact gate GREEN: DIM32 8/8, DIM16 3/3, DIM8 2/2, DIM4 2/2,
+  stock elaborate — OVERALL PASS** (`run_regression.sh --dims=32,16,8,4`). Also wired
+  `+loadmem` (`LOADMEM=1`) into `run_regression.sh`/`run_perf.sh`, and fixed `run_one` to pass
+  `FIRTOOL_BIN` (a stale-sim auto-rebuild had used system firtool 17 vs pinned 18 → spurious
+  `unexpected character` FAILs on DIM16/8/4, since rebuilt). Mesh/PE untouched. Nothing
+  committed (user commits). Full record: `PERF_ANALYSIS.md` "★★ PHASE C VALIDATED" +
+  `SIM_VALIDATION_NOTES.md`. **Next: decide bank-Phase-C vs. push command-issue/feed overlap.**
