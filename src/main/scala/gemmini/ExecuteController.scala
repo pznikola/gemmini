@@ -59,6 +59,16 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
         val read_b = Decoupled(new MXScaleSRAMReadReq(mx_scale_sp_entries))
         val resp_a = Flipped(Valid(new MXScaleSRAMReadResp(DIM, mx_scale_exp_bits)))
         val resp_b = Flipped(Valid(new MXScaleSRAMReadResp(DIM, mx_scale_exp_bits)))
+        // Scale-SRAM ping-pong WAR interlock (replaces the per-chunk CPU gemmini_fence()).
+        // loop_drained pulses once per drain-order loop boundary (mx_kb_wrap & mesh_resp.last),
+        // i.e. when a chunk finishes reading its scale-SRAM ping-pong half and frees it. The
+        // MXScaleLoadController maintains an in-flight-loop credit (one per chunk, incremented on
+        // that chunk's A-scale-mvin, decremented on this pulse) and refuses a new chunk's
+        // A-scale-mvin while all halves are still occupied -- exactly the invariant the CPU fence
+        // enforced (chunk C+halves waits for chunk C to drain), but tracked in hardware so the
+        // core never stalls. Legacy (k_blocks == 0) never wraps -> never pulses -> the load
+        // controller's interlock is disabled (see its `pipelined` input), bit-for-bit unchanged.
+        val loop_drained = Output(Bool())
       })
     } else {
       None
@@ -1078,6 +1088,15 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     }
   }
   val mx_drain_block = mx_out_kb
+
+  // Scale-SRAM ping-pong WAR interlock (replaces the per-chunk CPU gemmini_fence()): pulse when
+  // a chunk finishes draining and frees its scale-SRAM ping-pong half. Same event that advances
+  // the drain-order walk to the next loop (mx_kb_wrap at a mesh_resp.last of an MX output). The
+  // MXScaleLoadController counts these against its per-chunk A-scale-mvins to gate half reuse.
+  if (mx_enabled) {
+    io.mx.get.loop_drained := mesh_resp_valid && mesh_resp.last &&
+      mesh_resp.tag.rob_id.valid && mesh_resp.tag.mx_enabled && mx_kb_wrap
+  }
 
   // Scales for the currently-draining output: A exponent for this row, B exponent vector for
   // the N output columns (invalid is re-derived as `exp === 128`). Driven by the read-ahead

@@ -254,6 +254,12 @@ object GemminiConfigs {
   val stockDIM8Config  = smallChipConfig.copy(headerFileName = "gemmini_params_stock_dim8.h")
   val stockDIM4Config  = tinyChipConfig.copy(headerFileName = "gemmini_params_stock_dim4.h")
 
+  // NOTE (perf investigation 2026-07-01): deepening reservation_station_entries_ex to 32 here
+  // was measured to have ZERO effect (byte-identical mx_bench at 256^3), so the residual is NOT
+  // RS-occupancy bound. The dominant residual is the per-chunk full-barrier gemmini_fence()
+  // (fence_cyc = 24,436 = 42% of 256^3), a consequence of the depth-2 scale-SRAM ping-pong
+  // forcing a drain every other chunk. Left at the default; the parity lever is fence frequency
+  // (deeper pipelining / HW scale-half-reuse dependency), not RS depth. See PERF_ANALYSIS.md.
   val mxint8DIM32Config = largeChipConfig.copy(
     mx_enabled = true,
     mx_block_size = 32,

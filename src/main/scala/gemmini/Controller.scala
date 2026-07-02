@@ -404,10 +404,17 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     scale_sram.io.read_b <> ex_mx.read_b
     ex_mx.resp_a := scale_sram.io.resp_a
     ex_mx.resp_b := scale_sram.io.resp_b
+    // Scale-SRAM ping-pong WAR interlock: the load controller throttles a new chunk's
+    // A-scale-mvin against the ExecuteController's per-chunk drain pulse, replacing the CPU
+    // gemmini_fence(). Active only for the pipelined (k_blocks != 0) drain walk.
+    mx_scale_load_controller.io.pipelined := mx_loop_k_blocks =/= 0.U
+    mx_scale_load_controller.io.loop_drained := ex_mx.loop_drained
   } else {
     mx_scale_load_controller.io.dma.req.ready := false.B
     mx_scale_load_controller.io.dma.resp.valid := false.B
     mx_scale_load_controller.io.dma.resp.bits := DontCare
+    mx_scale_load_controller.io.pipelined := false.B
+    mx_scale_load_controller.io.loop_drained := false.B
   }
   ex_controller.io.srams.read <> spad.module.io.srams.read
   ex_controller.io.srams.write <> spad.module.io.srams.write

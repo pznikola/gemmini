@@ -17,7 +17,18 @@ class MXScaleLoadController[T <: Data, U <: Data, V <: Data](config: GemminiArra
     val stride_b = Input(UInt(coreMaxAddrBits.W))
     val completed = Decoupled(UInt(log2Up(reservation_station_entries).W))
     val busy = Output(Bool())
+    // Scale-SRAM ping-pong WAR interlock (replaces the per-chunk CPU gemmini_fence()).
+    // pipelined = the current MX loop uses the self-cycling drain walk (k_blocks != 0); only
+    // then is the interlock active. loop_drained pulses (from ExecuteController) when a chunk
+    // finishes reading its ping-pong half and frees it. See the credit logic below.
+    val pipelined = Input(Bool())
+    val loop_drained = Input(Bool())
   })
+
+  // Number of scale-SRAM ping-pong halves (parity bit -> 2). Must match ExecuteController's
+  // mx_rd_parity split. A new chunk's A-scale-mvin may write its half only while fewer than this
+  // many chunks are in flight (their halves still being read).
+  val mx_scale_pp_halves = 2
 
   val waiting_for_command :: waiting_for_dma_req_ready :: sending_rows :: Nil = Enum(3)
   val control_state = RegInit(waiting_for_command)
@@ -43,6 +54,18 @@ class MXScaleLoadController[T <: Data, U <: Data, V <: Data](config: GemminiArra
 
   val DoLoad = cmd.bits.cmd.inst.funct === LOAD_MX_SCALE_A_CMD ||
     cmd.bits.cmd.inst.funct === LOAD_MX_SCALE_B_CMD
+  val is_a_load = cmd.bits.cmd.inst.funct === LOAD_MX_SCALE_A_CMD
+
+  // Ping-pong WAR credit: count chunks whose scales are loaded but not yet drained. Each chunk
+  // issues exactly one A-scale-mvin (before its B-mvin and its matmul, in program order), so the
+  // A-mvin is the once-per-chunk increment; loop_drained (from ExecuteController) is the
+  // decrement. A new chunk's A-mvin is held while all ping-pong halves are occupied
+  // (credit >= halves) so its scales cannot clobber a half a prior chunk is still reading -- the
+  // exact invariant the CPU fence enforced, now without stalling the core. The chunk's own
+  // B-mvin is NOT gated (it targets the same freshly-claimed half). Legacy (`!pipelined`,
+  // k_blocks == 0) disables the interlock entirely -> bit-for-bit unchanged.
+  val mx_credit = RegInit(0.U(log2Ceil(mx_scale_pp_halves + 2).W))
+  val credit_blocks = io.pipelined && is_a_load && (mx_credit >= mx_scale_pp_halves.U)
 
   val nCmds = (max_in_flight_mem_reqs / DIM) + 1
   val deps_t = new Bundle {
@@ -59,7 +82,7 @@ class MXScaleLoadController[T <: Data, U <: Data, V <: Data](config: GemminiArra
 
   val actual_stride = Mux(stride === 0.U, cols, stride)
 
-  io.dma.req.valid := (control_state === waiting_for_command && cmd.valid && DoLoad && cmd_tracker.io.alloc.ready) ||
+  io.dma.req.valid := (control_state === waiting_for_command && cmd.valid && DoLoad && cmd_tracker.io.alloc.ready && !credit_blocks) ||
     control_state === waiting_for_dma_req_ready ||
     (control_state === sending_rows && row_counter =/= 0.U)
   io.dma.req.bits.vaddr := vaddr + row_counter * actual_stride
@@ -70,8 +93,20 @@ class MXScaleLoadController[T <: Data, U <: Data, V <: Data](config: GemminiArra
   io.dma.req.bits.is_b := is_b
   io.dma.req.bits.status := cmd.bits.cmd.status
 
-  cmd_tracker.io.alloc.valid := control_state === waiting_for_command && cmd.valid && DoLoad
+  cmd_tracker.io.alloc.valid := control_state === waiting_for_command && cmd.valid && DoLoad && !credit_blocks
   cmd_tracker.io.alloc.bits.bytes_to_read := rows * cols
+
+  // Credit update: +1 when a pipelined chunk's A-scale-mvin is accepted (claims a ping-pong
+  // half), -1 when a chunk drains (ExecuteController frees a half). credit_blocks holds off the
+  // A-mvin until a half is free, so the credit never exceeds mx_scale_pp_halves.
+  val credit_inc = io.pipelined && is_a_load && cmd_tracker.io.alloc.fire()
+  val credit_dec = io.loop_drained && mx_credit =/= 0.U
+  when (credit_inc && !credit_dec) {
+    mx_credit := mx_credit + 1.U
+  } .elsewhen (!credit_inc && credit_dec) {
+    mx_credit := mx_credit - 1.U
+  }
+  assert(mx_credit <= mx_scale_pp_halves.U, "MX scale ping-pong credit overflowed a half")
   cmd_tracker.io.alloc.bits.tag.rob_id := cmd.bits.rob_id.bits
   cmd_tracker.io.request_returned.valid := io.dma.resp.fire
   cmd_tracker.io.request_returned.bits.cmd_id := io.dma.resp.bits.cmd_id
