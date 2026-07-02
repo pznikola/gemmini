@@ -4,6 +4,94 @@ Measured on Verilator, `run_perf.sh`, square shapes, run-binary-fast. Cycle coun
 `read_cycles()` around the timed region (scale+payload mvin + compute + mvout).
 `ideal = M·N·K/DIM²` (one MAC per PE per cycle). `util = ideal/cycles`.
 
+## ★★★ POST-PHASE-C RESIDUAL PINNED: the per-chunk drain FENCE (2026-07-01) ★★★
+### (supersedes the "host command-issue serialization" framing — issue_cyc is real but not the whole story)
+
+Measurement-first parity investigation on the Phase-C-committed code (`e93ed01`),
+GemminiMXINT8DIM32 sim, `+loadmem`, all shapes bit-exact PASS. Same-harness stock DIM32 baseline
+(mx_bench built against `gemmini_params_stock_dim32.h`) = **38,709 cyc** at 256³ (the canonical
+35,238 is a lighter harness; use 38,709 for apples-to-apples here). MX 256³ = 57,596 = **1.49×**.
+
+**Step 1b — MX vs stock feed counters (256³, identical counter config):**
+| counter | stock | MX | MX/stock |
+|---|---:|---:|---:|
+| cycles | 38,709 | 57,596 | 1.49× |
+| matmul_in_progress (mesh fed) | 24,899 | 27,937 | **1.12×** |
+| loopmm_active (loop configured) | 36,299 | 49,938 | 1.38× |
+| spadA_wait / spadB_wait | 22,866 / 21,794 | 39,097 / 34,992 | ~1.7× |
+| overlap_haz / preload_haz | 0 / 0 | **0 / 0** | — |
+
+→ The mesh does ~stock-class feed work (**1.12×**); the datapath is not the bottleneck.
+`overlap_haz = 0` **definitively kills the drain-walk/BlockScaleUnit serialization theory** (the
+mesh is never blocked waiting for a prior output to drain). `spadA/B_wait` is high in stock too
+(~59%) — it is just the WS feed pattern; MX's excess is a *consequence* of the extra idle.
+
+**Step 2 — `reservation_station_entries_ex` 16→32 (MX config only): ZERO effect.** Rebuilt sim
+verified to carry 32 EX entries (indices 0–31 vs stock 15); mx_bench 256³ = 57,596, byte-identical
+every counter. ⇒ The residual is **not** RS-occupancy bound; the host-issue stall is upstream of
+the reservation station.
+
+**Step 2b — per-chunk host-cost partition (256³) — THE SMOKING GUN:**
+| host step | cycles | % of 57,986 |
+|---|---:|---:|
+| **gemmini_fence()** (drain barrier) | **24,436** | **42%** |
+| loop_ws_mx emission (issue_cyc) | 21,375 | 37% |
+| CONFIG_MXINT8 issue | 73 | 0.1% |
+| scale-mvin A / B issue | 72 / 399 | 0.8% |
+| **Σ host busy/blocked** | **46,355** | **80%** |
+
+The CPU is busy/blocked **80%** of runtime. Config + scale-mvin issue are negligible (kills the
+"scale-mvin issue backpressure" theory). The dominant term is the **per-chunk `gemmini_fence()`**:
+a *full accelerator barrier* that stalls the in-order Rocket until the entire accelerator drains
+before it can issue the next chunk. The tiler's depth-2 pairing
+(`do_fence = k_chunked || since_fence>=2 || !geom_same`, gemmini.h) fences every *other* chunk
+(~4 at 256³ ≈ 6,100 cyc/fence), because the scale-SRAM has only **2 ping-pong halves** — chunk
+N+2 reuses chunk N's half, so it must wait for N to drain. Each fence fully drains the pipeline,
+so chunk N+1's compute never overlaps chunk N's drain.
+
+**Parity ceiling & lever.** Removing the fence stalls → 57,986 − 24,436 ≈ **33.5k ≈ stock**. The
+lever is **fence frequency**, not RS depth: (a) deeper scale-SRAM ping-pong (4/8 halves → fence
+every 4th/8th chunk; capacity-vs-chunk-count tradeoff), and/or (b) replace the CPU full-barrier
+`gemmini_fence()` with a **hardware scale-half-reuse dependency** (chunk N+2's scale-mvin waits in
+the RS only for chunk N's half to free, tracked in HW) so the CPU never stalls and chunks pipeline.
+Both are `mx_enabled`-gated (ReservationStation / scale-load / the P3 `k_blocks` drain-order path);
+Mesh/PE/MeshWithDelays stay DO-NOT-TOUCH. Earlier P3 removed only the *every-other* fence (−7%);
+these remaining parity-reuse fences are the residual. (Instrumentation: mx_bench MXCPU line now
+prints `fence_cyc/config_cyc/scalea_cyc/scaleb_cyc`; observation-only, bit-exact.)
+
+## ★ HW scale-half interlock BUILT + the depth-2 ceiling (2026-07-01) — fence removed, but parity is capacity-bound
+
+Built the hardware scale-SRAM ping-pong WAR interlock (all `mx_enabled`-gated; Mesh/PE/MeshWithDelays
+untouched): `ExecuteController.loop_drained` pulses once per chunk drain; `MXScaleLoadController`
+holds a per-chunk A-scale-mvin credit (+1 on the chunk's A-mvin, −1 on `loop_drained`) and stalls a
+new chunk's A-mvin while all ping-pong halves are occupied; the tiler drops the per-chunk
+`gemmini_fence()` and runs continuous parity. Legacy (`k_blocks==0`) / stock bit-for-bit unchanged.
+
+- **Stage 1 (interlock in, tiler still fenced): inert + bit-exact** — 256³ = 57,986 byte-identical,
+  proving the interlock is correctly plumbed and idle under the fences.
+- **Stage 2 (fence dropped, interlock active): bit-exact PASS, but only −2.9%** (57,986 → 56,330).
+  `fence_cyc` collapsed **24,436 → 2** (the fence IS gone) but `issue_cyc` rose **21,375 → 43,884**
+  (+22,509 ≈ the removed fence) and **mesh util is unchanged** (`matmul_in_progress` 28,369 → 28,139,
+  ~49%). The stall merely **relocated** from the CPU fence to RoCC-issue backpressure.
+
+**Meaning: the fence was a *symptom* of a depth-2 pipeline, not the root cause.** Depth-2 is
+enforced in three places — the fence (now removed), **`concurrent_loops = 2`** (a 3rd `loop_ws`
+blocks until loop 1 drains — same drain-gating as the fence), and the **scale-SRAM's 2 ping-pong
+halves**. The last is **capacity-bound at 256³ DIM32**: the scale SRAM is 256 rows and a chunk's
+A-scales are `i_chunk·DIM = 4·32 = 128 = exactly half`, so only two chunks' scales physically fit.
+Reaching parity needs deeper pipelining (raise `concurrent_loops` + add ping-pong halves), which at
+this shape costs more scale-SRAM area or smaller chunks (more chunks → more issue overhead — the
+"capacity-vs-overlap wash" the D2/P3 notes predicted). The interlock is the *enabler* for deeper
+pipelining (it removes the fence safely and generalizes to N halves), but N=2 alone does not move
+the needle. Net: MX datapath is stock-class (mesh work 1.12× stock); the residual is a depth-2
+host-issue/scale-capacity ceiling, not the fence and not the mesh.
+
+**Full bit-exact gate GREEN (2026-07-02, `run_regression.sh --build-sims --dims=32,16,8,4`):**
+all 4 MX sims re-elaborated with the interlock RTL; DIM32 8/8, DIM16 3/3, DIM8 2/2, DIM4 2/2,
+`stock:elaborate` PASS — **OVERALL PASS**. Confirms the interlock + fenceless tiler are bit-exact
+on the DIM<32 two-phase drain path too and leave stock unchanged → safe to commit. Real parity
+still needs Path B (load all scales once into a 16 KB scale SRAM); see the plan file.
+
 ## ★★ PHASE C VALIDATED in-sim (2026-06-30, GemminiMXINT8DIM32, run with `+loadmem`)
 
 Offline B-scale pre-tiling (constant weights → pre-tile once, untimed). New API in
