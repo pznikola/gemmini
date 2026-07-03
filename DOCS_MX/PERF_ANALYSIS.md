@@ -4,6 +4,38 @@ Measured on Verilator, `run_perf.sh`, square shapes, run-binary-fast. Cycle coun
 `read_cycles()` around the timed region (scale+payload mvin + compute + mvout).
 `ideal = M·N·K/DIM²` (one MAC per PE per cycle). `util = ideal/cycles`.
 
+## ★★ OPERAND-REUSE FIX: MX tiler was re-fetching B every i-chunk (2026-07-03) ★★
+
+Root-caused the post-interlock residual with a DMA-byte measurement (mx_bench, GemminiMXINT8DIM32
+vs GemminiStockDIM32, same harness/counters): with a loop *configured* 95% of the time yet the
+mesh fed only 49%, the loss is an **intra-loop feed bubble**, and **MX reads EXACTLY 2× the
+operand bytes of stock** (256³ rd_bytes 1,572,864 vs 786,432; writes identical). It is NOT
+bandwidth-bound — MX's `rdma_tl_wait` is *lower* than stock's (21% vs 37%) and `load_dma_wait=0`.
+Cause: `tiled_matmul_mxint8_impl` passed `b_spad_id=0` and a non-NULL B every chunk, so weight
+tile B(k0,j0) was reloaded for all 4 i-chunks; stock's `tiled_matmul_outer` keeps B resident and
+reuses it across the i-sweep.
+
+**Fix (software only, no RTL, no area):** port stock's operand reuse into the MX tiler — compute
+`b_reuse = (mx_JC*mx_KC <= 2)` / `a_reuse = (mx_IC*mx_KC <= 2)`, set `a_spad_id`/`b_spad_id` to the
+resident scratchpad region (1/2), and pass `B_payload=NULL` for i0>=1 (A=NULL for j0>=1) so the
+shared unroller skips the re-mvin (`dram_addr===0 -> skip`, LoopMatmul) and the compute reads the
+resident region (`b_ex_spad_id`). The scale sidecar (per-chunk scale-mvins, ping-pong parity,
+B-scale cache) is orthogonal and unchanged; `spad_id 0` reproduces the old behavior exactly.
+
+**Measured (mx_bench, +loadmem, all PASS):**
+| shape | interlock only | + reuse | in-harness stock |
+|---|---:|---:|---:|
+| 256³ | 56,330 | **45,483** | 38,632 |
+| 128³ | 10,172 | 9,359 | 8,746 |
+
+- **256³: −19% (1.46× → 1.18× stock)**; `rdma_active` 25,520 → 17,158 (−33%, the B re-fetch is
+  gone); util 28% → 36%.
+- **Full bit-exact gate GREEN** (`run_regression.sh --dims=32,16,8,4`, reusing the interlock sims
+  since this is software-only): DIM32 8/8, DIM16 3/3, DIM8 2/2, DIM4 2/2, stock elaborate —
+  OVERALL PASS. Holds on the DIM<32 two-phase (`mx_reorder`) path.
+- Progression: Phase C 57,423 → interlock 56,330 → reuse **45,483**. Remaining gap to stock is the
+  per-chunk scale-mvin issue (Path B territory). Stacks with Path B.
+
 ## ★★★ POST-PHASE-C RESIDUAL PINNED: the per-chunk drain FENCE (2026-07-01) ★★★
 ### (supersedes the "host command-issue serialization" framing — issue_cyc is real but not the whole story)
 
