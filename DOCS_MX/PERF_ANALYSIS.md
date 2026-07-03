@@ -4,6 +4,31 @@ Measured on Verilator, `run_perf.sh`, square shapes, run-binary-fast. Cycle coun
 `read_cycles()` around the timed region (scale+payload mvin + compute + mvout).
 `ideal = M·N·K/DIM²` (one MAC per PE per cycle). `util = ideal/cycles`.
 
+## PATH B (load scales once) — BUILT, MEASURED, then REVERTED as poor ROI (2026-07-03)
+
+Implemented Path B end-to-end (bit-exact PASS on DIM32) to remove the per-chunk scale-mvins:
+16 KB scale SRAM (2×), a drain-ordered per-chunk global-tile-offset FIFO in ExecuteController,
+CONFIG_MXINT8 global-scale decode, and a `gemmini.h` fast path that loads the whole problem's
+A/B scale images ONCE up front then runs each chunk as a pure config+`loop_ws` reading the
+resident images by global offset (no per-chunk scale-mvin / ping-pong / interlock / fence). All
+`mx_enabled`-gated (conservative gate: DIM==block, K not chunked, square, evenly divisible, fits).
+
+**Result: 256³ = 44,529 (1.15× stock) — only ~2.7% below the reuse fix's 45,483 (1.18×).** The
+operand-reuse fix had already removed the dominant residual; the per-chunk scale-mvins were a
+small remainder. Cost of Path B: **+8 KB scale SRAM + the offset-FIFO/decode RTL** — a poor ROI
+that also undercuts the "zero-PE-modification, low-cost retrofit" thesis. **Reverted; the
+committed reuse fix (1.18× stock, software-only, zero area) is the banked result.**
+
+**Residual investigation (why 1.15× is near the floor):** the BlockScaleUnit is **combinational**
+(`scalePowerOfTwo`/`saturateToAcc` applied in the mesh's output cycle, no delay register —
+ExecuteController.scala:1322-1328), so the scale-application adds **zero drain latency** (RES-OPT
+confirmed). `matmul_in_progress` is "mesh has a matmul in flight": MX 60% vs stock 64% — the MX
+mesh idles slightly *more* (not holds longer). The 5,897-cyc gap is small feed/scheduling
+difference vs stock's hand-tuned `tiled_matmul_auto` (per-chunk CONFIG_MXINT8, minor feed bubbles)
+plus a one-time upfront scale load (amortizable in deployment, like the Phase C offline pretile).
+**No cheap hardware win remains** — it is not a datapath stall, and closing it further means
+out-tuning the stock tiler or touching the DO-NOT-TOUCH mesh feed.
+
 ## ★★ OPERAND-REUSE FIX: MX tiler was re-fetching B every i-chunk (2026-07-03) ★★
 
 Root-caused the post-interlock residual with a DMA-byte measurement (mx_bench, GemminiMXINT8DIM32
