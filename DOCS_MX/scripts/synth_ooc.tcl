@@ -23,16 +23,31 @@ set out_dir     [lindex $argv 4]
 set collateral "$gen_src_dir/gen-collateral"
 file mkdir $out_dir
 
-# Read every file in the firtool filelist (paths are relative to gen-collateral).
-# Vivado elaborates only the $top hierarchy; unused modules are dropped.
+# Read synthesizable Verilog/SystemVerilog files from the firtool filelist (paths are
+# relative to gen-collateral). Chipyard's filelist can also contain simulation C++/headers
+# such as SimUART.cc; those must not be handed to Vivado synthesis.
 set fl [open "$collateral/filelist.f" r]
 set sv_files {}
+set skipped_files {}
 while {[gets $fl line] >= 0} {
   set line [string trim $line]
   if {$line eq ""} { continue }
-  lappend sv_files "$collateral/$line"
+  if {[regexp {\.s?v$} $line]} {
+    lappend sv_files "$collateral/$line"
+  } else {
+    lappend skipped_files $line
+  }
 }
 close $fl
+set mem_files [glob -nocomplain -directory $collateral *.top.mems.v]
+foreach mf $mem_files {
+  lappend sv_files $mf
+}
+puts "OOC_READ_VERILOG files=[llength $sv_files] skipped_non_verilog=[llength $skipped_files]"
+puts "OOC_READ_MEM_FILES files=[llength $mem_files] $mem_files"
+if {[llength $skipped_files] > 0} {
+  puts "OOC_SKIPPED_NON_VERILOG $skipped_files"
+}
 read_verilog -sv $sv_files
 
 # Identical clock constraint for all configs, loaded before synthesis so the run is

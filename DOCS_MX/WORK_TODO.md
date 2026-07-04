@@ -1,20 +1,22 @@
 # MXINT8 Work TODO
 
-Status snapshot: 2026-07-03.
+Status snapshot: 2026-07-04.
 
 This file tracks open work only. Completed work belongs in `WORK_DONE.md`; hard
 limitations and known caveats belong in `KNOWN_ISSUES.md`.
 
 ## Refresh Evidence
 
-- [ ] Re-run the full bit-exact regression from the cleaned documentation state:
-  `DOCS_MX/scripts/run_regression.sh --build-sims --dims=32,16,8,4`.
-- [ ] Re-run performance after the July 3 operand-reuse fix and replace stale
-  generated data. With the currently checked-in stock headers, use
-  `DOCS_MX/scripts/run_perf.sh --build-sims --dims 32,16`; extend to
-  `--dims 32,16,8,4` after stock DIM8/DIM4 params headers are present.
-- [ ] Re-run OOC synthesis/resource data when Vivado is available:
-  `DOCS_MX/scripts/run_synth.sh`.
+- [x] Resolve the final regression blocker. The apparent direct-test stalls were
+  target-side regression-test runtime issues, not hardware deadlocks. After
+  shortening the slow baremetal MX tests, DIM32 and DIM16 MX regression matrices
+  pass with repo-local `RUN_DIR`/`TMPDIR` under `sims/verilator/gemmini`.
+- [x] Re-run corrected DIM32/DIM16 performance evidence for pure stock INT8 vs
+  MXINT8. Result: `DOCS_MX/scripts/results/perf_i20.csv`.
+- [x] Re-run corrected DIM32/DIM16 OOC synthesis/resource data with Vivado.
+  Result: `DOCS_MX/scripts/results/synth_i20.csv`.
+- [ ] Extend fresh performance/synthesis/regression evidence to DIM8/DIM4 after
+  stock DIM8/DIM4 params headers and fair baseline configs are finalized.
 - [ ] If fresh `perf.csv` and `synth.csv` are intentionally produced, regenerate
   the comparison report with `DOCS_MX/scripts/make_report.py`, but do not treat the
   generated Markdown as a live canonical document unless the documentation policy changes.
@@ -33,9 +35,9 @@ limitations and known caveats belong in `KNOWN_ISSUES.md`.
   and decide whether any wider-accumulator option is worth the area/timing cost.
 - [ ] P5 transpose/OS decision: either add one supported transpose/output-stationary
   path or explicitly scope the project and paper claims to untransposed WS GEMM.
-- [ ] Evaluate whether the remaining 1.18x stock gap matters for the thesis. If it
-  does, investigate stock-tiler parity and mesh-feed scheduling before reviving any
-  hardware-heavy Path B style design.
+- [ ] Evaluate whether the remaining DIM16 large-shape gap matters for the thesis.
+  DIM32 is now faster than pure stock on the measured square smoke tests, but
+  DIM16 still trails stock at 128^3 and 256^3.
 - [ ] Study deeper scale-SRAM ping-pong only if there is a concrete workload that
   needs it. The existing depth-2 interlock is correct, but 256^3 DIM32 is scale
   capacity bound with two halves.

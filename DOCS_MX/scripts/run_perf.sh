@@ -7,7 +7,8 @@
 # results/perf.csv. Resumable: (config) rows already in the CSV are skipped.
 #
 # Usage:
-#   ./run_perf.sh [--build-sims] [--dims 32,16,8,4]
+#   ./run_perf.sh [--build-sims] [--dims 32,16,8,4] [--impl both|stock|mx]
+#                 [--csv results/perf_i03.csv] [--force]
 #
 # Prereqs: the per-DIM params headers exist (gemmini_params_mxint8_dim<D>.h and
 # gemmini_params_stock_dim<D>.h in gemmini-rocc-tests/include), and the Verilator sims
@@ -21,23 +22,44 @@ TESTS_DIR="$REPO/generators/gemmini/software/gemmini-rocc-tests"
 BUILD_DIR="$TESTS_DIR/build/bareMetalC"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULTS_DIR="$SCRIPT_DIR/results"
+RUN_DIR="${MX_RUN_DIR:-$REPO/sims/verilator/gemmini}"
+LOG_DIR="$RUN_DIR/logs"
+TMP_DIR="$RUN_DIR/tmp"
 CSV="$RESULTS_DIR/perf.csv"
 TIMEOUT_CYCLES=2000000000   # BERT shapes far exceed the regression default
 
 BUILD_SIMS=0
+FORCE=0
 DIMS="32,16,8,4"
+IMPLS="stock,mx"
 prev=""
 for arg in "$@"; do
   case "$prev" in
     --dims) DIMS="$arg"; prev=""; continue ;;
+    --csv) CSV="$arg"; prev=""; continue ;;
+    --impl) IMPLS="$arg"; prev=""; continue ;;
   esac
   case "$arg" in
     --build-sims) BUILD_SIMS=1 ;;
+    --force) FORCE=1 ;;
     --dims) prev="--dims" ;;
     --dims=*) DIMS="${arg#--dims=}" ;;
+    --csv) prev="--csv" ;;
+    --csv=*) CSV="${arg#--csv=}" ;;
+    --impl) prev="--impl" ;;
+    --impl=*) IMPLS="${arg#--impl=}" ;;
     *) echo "unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
+
+case "$IMPLS" in
+  both) IMPLS="stock,mx" ;;
+  stock|mx|stock,mx|mx,stock) ;;
+  *) echo "unknown --impl value: $IMPLS (use both, stock, mx, stock,mx, or mx,stock)" >&2; exit 2 ;;
+esac
+
+mkdir -p "$RESULTS_DIR" "$(dirname "$CSV")" "$LOG_DIR" "$TMP_DIR"
+export TMPDIR="$TMP_DIR"
 
 # --- Environment (JDK trap: system JDK 21 shadows conda JDK 20) --------------------
 set +u
@@ -48,7 +70,10 @@ java -version 2>&1 | grep -q 'version "20' \
   || { echo "FATAL: JDK 20 not active (JDK trap — see AGENT.md §1)"; exit 1; }
 [ -x "$FIRTOOL" ] || { echo "FATAL: pinned firtool missing at $FIRTOOL"; exit 1; }
 
-mkdir -p "$RESULTS_DIR"
+echo "RUN_DIR=$RUN_DIR"
+echo "LOG_DIR=$LOG_DIR"
+echo "TMPDIR=$TMPDIR"
+echo "CSV=$CSV"
 # Write the header if the file is missing or empty (a truncated/reset CSV must still
 # get a header, or make_report.py's DictReader mis-keys the first data row).
 [ -s "$CSV" ] || echo "config,impl,dim,M,N,K,cycles,macs,ideal_cycles,util_pct,result" > "$CSV"
@@ -57,50 +82,67 @@ FAILED=0
 
 build_bench() {  # build_bench <header-file>
   local hdr="$TESTS_DIR/include/$1"
+  local safe_hdr="${1//[^A-Za-z0-9_.-]/_}"
+  local saved="$TMP_DIR/gemmini_params.saved.h"
+  local build_args=()
   [ -f "$hdr" ] || { echo "  missing header $hdr"; return 1; }
-  cp "$TESTS_DIR/include/gemmini_params.h" /tmp/gemmini_params.stock.h
+  [ -z "${MX_EXTRA_CFLAGS:-}" ] || build_args+=("EXTRA_CFLAGS=$MX_EXTRA_CFLAGS")
+  cp "$TESTS_DIR/include/gemmini_params.h" "$saved"
   cp "$hdr" "$TESTS_DIR/include/gemmini_params.h"
-  ( cd "$TESTS_DIR" && ./build.sh ) > "/tmp/mx_perf_build_$1.log" 2>&1
+  ( cd "$TESTS_DIR" && ./build.sh "${build_args[@]}" ) > "$LOG_DIR/mx_perf_build_$safe_hdr.log" 2>&1
   local rc=$?
-  cp /tmp/gemmini_params.stock.h "$TESTS_DIR/include/gemmini_params.h"
+  cp "$saved" "$TESTS_DIR/include/gemmini_params.h"
   return $rc
 }
 
 run_bench() {  # run_bench <Config> <header-file>
   local cfg="$1" hdr="$2"
+  if [ "$FORCE" -eq 1 ] && grep -q "^$cfg," "$CSV"; then
+    local tmp_csv="$TMP_DIR/perf.$cfg.csv"
+    awk -F, -v cfg="$cfg" 'NR == 1 || $1 != cfg' "$CSV" > "$tmp_csv" && mv "$tmp_csv" "$CSV"
+  fi
   if grep -q "^$cfg," "$CSV"; then
     echo "=== $cfg: already in $CSV, skipping (delete its rows to re-run)"
     return 0
   fi
+  if [ "$BUILD_SIMS" -eq 1 ]; then
+    echo "=== $cfg: building Verilator sim and refreshing generated params header"
+    make -C "$REPO/sims/verilator" CONFIG="$cfg" FIRTOOL_BIN="$FIRTOOL" \
+      > "$LOG_DIR/mx_perf_sim_$cfg.log" 2>&1 || { echo "  SIM BUILD FAILED"; return 1; }
+  fi
+
   echo "=== $cfg: building mx_bench against $hdr"
   build_bench "$hdr" || { echo "  TEST BUILD FAILED"; return 1; }
-
-  if [ "$BUILD_SIMS" -eq 1 ]; then
-    echo "=== $cfg: building Verilator sim"
-    make -C "$REPO/sims/verilator" CONFIG="$cfg" FIRTOOL_BIN="$FIRTOOL" \
-      > "/tmp/mx_perf_sim_$cfg.log" 2>&1 || { echo "  SIM BUILD FAILED"; return 1; }
-  fi
 
   echo "=== $cfg: running mx_bench (this can take hours for the BERT shapes)"
   # LOADMEM=1 preloads DRAM with the ELF (common.mk get_loadmem_flag), bypassing the slow TSI
   # serial loader so mx_bench's large .bss does not gate boot time.
   make -C "$REPO/sims/verilator" CONFIG="$cfg" FIRTOOL_BIN="$FIRTOOL" run-binary-fast \
     BINARY="$BUILD_DIR/mx_bench-baremetal" LOADMEM=1 timeout_cycles=$TIMEOUT_CYCLES \
-    > "/tmp/mx_perf_run_$cfg.log" 2>&1
+    > "$LOG_DIR/mx_perf_run_$cfg.log" 2>&1
   local rc=$?
 
   local log="$REPO/sims/verilator/output/chipyard.harness.TestHarness.$cfg/mx_bench-baremetal.log"
   if [ -f "$log" ]; then
     grep -a "^MXBENCH," "$log" | sed "s/^MXBENCH,/$cfg,/; s/impl=//; s/dim=//; s/M=//; s/N=//; s/K=//; s/cycles=//; s/macs=//; s/ideal_cycles=//; s/util_pct=//; s/result=//" >> "$CSV" || true
   fi
-  [ $rc -eq 0 ] || { echo "  RUN FAILED (rc=$rc, see /tmp/mx_perf_run_$cfg.log)"; return 1; }
+  [ "$rc" -eq 0 ] || { echo "  RUN FAILED (rc=$rc, see $LOG_DIR/mx_perf_run_$cfg.log)"; return 1; }
   return 0
 }
 
 IFS=',' read -ra DIM_LIST <<< "$DIMS"
+IFS=',' read -ra IMPL_LIST <<< "$IMPLS"
 for d in "${DIM_LIST[@]}"; do
-  run_bench "GemminiStockDIM${d}RocketConfig" "gemmini_params_stock_dim${d}.h" || FAILED=1
-  run_bench "GemminiMXINT8DIM${d}RocketConfig" "gemmini_params_mxint8_dim${d}.h" || FAILED=1
+  for impl in "${IMPL_LIST[@]}"; do
+    case "$impl" in
+      stock)
+        run_bench "GemminiStockDIM${d}RocketConfig" "gemmini_params_stock_dim${d}.h" || FAILED=1
+        ;;
+      mx)
+        run_bench "GemminiMXINT8DIM${d}RocketConfig" "gemmini_params_mxint8_dim${d}.h" || FAILED=1
+        ;;
+    esac
+  done
 done
 
 echo

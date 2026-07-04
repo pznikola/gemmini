@@ -1,0 +1,5 @@
+config,part,clk_ns,lut,ff,bram36,dsp,wns_ns,fmax_mhz
+GemminiStockDIM32RocketConfig,xc7a200tsbg484-1,10.0,211458,118470,320,269,-39.157,20.343
+GemminiMXINT8DIM32RocketConfig,xc7a200tsbg484-1,10.0,243494,121270,352,272,-39.026,20.3973
+GemminiStockDIM16RocketConfig,xc7a200tsbg484-1,10.0,92992,53058,160,236,-41.159,19.5469
+GemminiMXINT8DIM16RocketConfig,xc7a200tsbg484-1,10.0,120825,61005,168,239,-39.464,20.2167

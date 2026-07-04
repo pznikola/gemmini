@@ -7,7 +7,7 @@
 # chipyard jar build is not parallel-safe).
 #
 # Usage:
-#   ./run_synth.sh [--skip-verilog] [config ...]
+#   ./run_synth.sh [--skip-verilog] [--csv path] [config ...]
 # Default config list: the stock-vs-MX pairs at each DIM.
 
 set -u
@@ -17,6 +17,8 @@ FIRTOOL="$HOME/.cache/llvm-firtool/1.62.1/bin/firtool"
 VIVADO_SETTINGS="$HOME/Programs/Xilinx/Vivado/2022.2/settings64.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULTS_DIR="$SCRIPT_DIR/results"
+RUN_DIR="${MX_RUN_DIR:-$REPO/sims/verilator/gemmini}"
+LOG_DIR="$RUN_DIR/logs"
 SYNTH_DIR="$RESULTS_DIR/synth"
 CSV="$RESULTS_DIR/synth.csv"
 
@@ -32,13 +34,27 @@ GemminiStockDIM4RocketConfig  GemminiMXINT8DIM4RocketConfig"
 
 SKIP_VERILOG=0
 CONFIGS=""
-for arg in "$@"; do
-  case "$arg" in
-    --skip-verilog) SKIP_VERILOG=1 ;;
-    *) CONFIGS="$CONFIGS $arg" ;;
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --skip-verilog)
+      SKIP_VERILOG=1
+      shift
+      ;;
+    --csv)
+      [ "$#" -ge 2 ] || { echo "FATAL: --csv requires a path"; exit 1; }
+      CSV="$2"
+      shift 2
+      ;;
+    *)
+      CONFIGS="$CONFIGS $1"
+      shift
+      ;;
   esac
 done
 [ -z "$CONFIGS" ] && CONFIGS="$DEFAULT_CONFIGS"
+
+mkdir -p "$SYNTH_DIR" "$LOG_DIR" "$RUN_DIR/tmp" "$(dirname "$CSV")"
+export TMPDIR="$RUN_DIR/tmp"
 
 # --- Environment (JDK trap: system JDK 21 shadows conda JDK 20) --------------------
 set +u
@@ -54,7 +70,10 @@ source "$VIVADO_SETTINGS"
 set -u
 command -v vivado >/dev/null || { echo "FATAL: vivado not on PATH after settings64.sh"; exit 1; }
 
-mkdir -p "$SYNTH_DIR"
+echo "RUN_DIR=$RUN_DIR"
+echo "LOG_DIR=$LOG_DIR"
+echo "TMPDIR=$TMPDIR"
+echo "CSV=$CSV"
 # Write the header if the file is missing or empty (so a reset CSV still parses).
 [ -s "$CSV" ] || echo "config,part,clk_ns,lut,ff,bram36,dsp,wns_ns,fmax_mhz" > "$CSV"
 
@@ -69,8 +88,8 @@ for cfg in $CONFIGS; do
   if [ "$SKIP_VERILOG" -eq 0 ]; then
     echo "=== $cfg: elaborating to Verilog"
     make -C "$REPO/sims/verilator" CONFIG="$cfg" FIRTOOL_BIN="$FIRTOOL" verilog \
-      > "/tmp/mx_synth_elab_$cfg.log" 2>&1 \
-      || { echo "  ELABORATION FAILED (see /tmp/mx_synth_elab_$cfg.log)"; FAILED=1; continue; }
+      > "$LOG_DIR/mx_synth_elab_$cfg.log" 2>&1 \
+      || { echo "  ELABORATION FAILED (see $LOG_DIR/mx_synth_elab_$cfg.log)"; FAILED=1; continue; }
   fi
   [ -f "$gen_src/gen-collateral/filelist.f" ] \
     || { echo "  missing $gen_src/gen-collateral/filelist.f"; FAILED=1; continue; }
@@ -81,7 +100,7 @@ for cfg in $CONFIGS; do
   ( cd "$out" && vivado -mode batch -nojournal -log "$out/vivado.log" \
       -source "$SCRIPT_DIR/synth_ooc.tcl" \
       -tclargs "$gen_src" "$TOP" "$PART" "$CLK_NS" "$out" ) \
-      > "/tmp/mx_synth_vivado_$cfg.log" 2>&1 \
+      > "$LOG_DIR/mx_synth_vivado_$cfg.log" 2>&1 \
     || { echo "  VIVADO FAILED (see $out/vivado.log)"; FAILED=1; continue; }
 
   # --- Parse reports -> CSV row -----------------------------------------------------
