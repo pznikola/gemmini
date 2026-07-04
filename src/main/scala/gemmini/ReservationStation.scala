@@ -90,7 +90,7 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     // MXINT8: scale-vector mvins are real DMA loads (not stateless configs), but
     // they target the sidecar MXScaleSRAM, not the scratchpad, so they carry no
     // address range. This marker lets a compute depend on in-flight scale loads.
-    val is_mx_scale = Bool()
+    val is_mx_scale = if (mx_enabled) Some(Bool()) else None
 
     val opa = UDValid(new OpT)
     val opa_is_dst = Bool()
@@ -118,6 +118,8 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     // Debugging signals
     val allocated_at = UInt(instructions_allocated.getWidth.W)
   }
+
+  private def isMxScaleEntry(e: Entry): Bool = if (mx_enabled) e.is_mx_scale.get else false.B
 
   assert(isPow2(reservation_station_entries_ld))
   assert(isPow2(reservation_station_entries_ex))
@@ -195,14 +197,18 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     val cmd = io.alloc.bits.cmd
     val funct = cmd.inst.funct
     val funct_is_compute = funct === COMPUTE_AND_STAY_CMD || funct === COMPUTE_AND_FLIP_CMD
-    val funct_is_mx_scale_load = funct === LOAD_MX_SCALE_A_CMD || funct === LOAD_MX_SCALE_B_CMD
+    val funct_is_mx_scale_load = if (mx_enabled) {
+      funct === LOAD_MX_SCALE_A_CMD || funct === LOAD_MX_SCALE_B_CMD
+    } else false.B
     val config_cmd_type = cmd.rs1(1,0) // TODO magic numbers
 
     new_entry.issued := false.B
     new_entry.cmd := io.alloc.bits
 
     new_entry.is_config := funct === CONFIG_CMD || funct_is_mx_scale_load
-    new_entry.is_mx_scale := funct_is_mx_scale_load
+    if (mx_enabled) {
+      new_entry.is_mx_scale.get := funct_is_mx_scale_load
+    }
 
     val op1 = Wire(UDValid(new OpT))
     op1.valid := false.B
@@ -348,7 +354,7 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
       // mvin: scales live in the sidecar MXScaleSRAM (no address range to overlap), so
       // without this the matmul could read stale scales before the scale DMA completes.
       new_entry.deps_ld := VecInit(entries_ld.map { e => e.valid && (
-        e.bits.is_mx_scale ||
+        isMxScaleEntry(e.bits) ||
         (e.bits.opa.valid && not_config && (
           new_entry.opa.bits.overlaps(e.bits.opa.bits) || // waw if preload, raw if compute
           new_entry.opb.bits.overlaps(e.bits.opa.bits))))}) // raw
@@ -397,7 +403,7 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     // controller's real completion signal, not on issue. Otherwise the entry would be
     // freed before MXScaleSRAM is written, and the later DMA completion would strike a
     // freed/reused load slot (firing the completion-path valid assert).
-    new_entry.complete_on_issue := new_entry.is_config && new_entry.q =/= exqu && !new_entry.is_mx_scale
+    new_entry.complete_on_issue := new_entry.is_config && new_entry.q =/= exqu && !isMxScaleEntry(new_entry)
 
     Seq(
       (ldqu, entries_ld, new_allocs_oh_ld, reservation_station_entries_ld),
@@ -431,7 +437,7 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
         when (!set_only_strides) {
           a_transpose := new_entry.cmd.cmd.rs1(8) // TODO magic numbers
         }
-      }.elsewhen(new_entry.is_config && new_entry.q === ldqu && !new_entry.is_mx_scale) {
+      }.elsewhen(new_entry.is_config && new_entry.q === ldqu && !isMxScaleEntry(new_entry)) {
         // MXINT8 scale-vector mvins are `is_config` (they carry no spad address range), but they
         // are NOT CONFIG_LOAD instructions: their rs1 is the scale buffer's DRAM POINTER. Without
         // the `is_mx_scale` exclusion above, pointer bits were decoded as a config here --
@@ -637,50 +643,52 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
   io.counter.connectEventSignal(CounterEvent.RESERVATION_STATION_ACTIVE_CYCLES, io.busy)
   io.counter.connectEventSignal(CounterEvent.RESERVATION_STATION_FULL_CYCLES, !io.alloc.ready)
 
-  // RS-internal partition: why is there no issuable EX command for the execute controller?
-  val ex_ready_unissued = entries_ex.map(e => e.valid && !e.bits.issued && e.bits.ready()).reduce(_ || _)
-  val ex_blocked        = entries_ex.map(e => e.valid && !e.bits.issued && !e.bits.ready()).reduce(_ || _)
-  val ex_inflight       = entries_ex.map(e => e.valid && e.bits.issued).reduce(_ || _)
-  val ld_inflight       = entries_ld.map(e => e.valid && e.bits.issued).reduce(_ || _)
-  io.counter.connectEventSignal(CounterEvent.MX_DBG_EX_READY_CYCLE, ex_ready_unissued)
-  io.counter.connectEventSignal(CounterEvent.MX_DBG_EX_BLOCKED_CYCLE, ex_blocked)
-  io.counter.connectEventSignal(CounterEvent.MX_DBG_EX_INFLIGHT_CYCLE, ex_inflight)
-  io.counter.connectEventSignal(CounterEvent.MX_DBG_EX_POOL_FULL_CYCLE, full_ex)
-  io.counter.connectEventSignal(CounterEvent.MX_DBG_LD_INFLIGHT_CYCLE, ld_inflight)
+  if (mx_enabled) {
+    // RS-internal partition: why is there no issuable EX command for the execute controller?
+    val ex_ready_unissued = entries_ex.map(e => e.valid && !e.bits.issued && e.bits.ready()).reduce(_ || _)
+    val ex_blocked        = entries_ex.map(e => e.valid && !e.bits.issued && !e.bits.ready()).reduce(_ || _)
+    val ex_inflight       = entries_ex.map(e => e.valid && e.bits.issued).reduce(_ || _)
+    val ld_inflight       = entries_ld.map(e => e.valid && e.bits.issued).reduce(_ || _)
+    io.counter.connectEventSignal(CounterEvent.MX_DBG_EX_READY_CYCLE, ex_ready_unissued)
+    io.counter.connectEventSignal(CounterEvent.MX_DBG_EX_BLOCKED_CYCLE, ex_blocked)
+    io.counter.connectEventSignal(CounterEvent.MX_DBG_EX_INFLIGHT_CYCLE, ex_inflight)
+    io.counter.connectEventSignal(CounterEvent.MX_DBG_EX_POOL_FULL_CYCLE, full_ex)
+    io.counter.connectEventSignal(CounterEvent.MX_DBG_LD_INFLIGHT_CYCLE, ld_inflight)
 
-  // Phase-0b DAE-inversion partition (observation-only): attribute the EX dependency stall to
-  // in-flight MX scale-mvins. A matmul's dep on an is_mx_scale load clears only on the scale
-  // DMA's COMPLETION (complete_on_issue=false at :400; cross-queue clear at :494-503), so a
-  // matmul gated on a live scale load is the decoupled-access-execute inversion we suspect.
-  // ld_is_scale[i] marks load-pool slot i as a still-in-flight scale-vector mvin.
-  val ld_is_scale = entries_ld.map(e => e.valid && e.bits.is_mx_scale)
-  val ex_blocked_on_scale = entries_ex.map { e =>
-    val scale_dep = e.bits.deps_ld.zip(ld_is_scale).map { case (d, s) => d && s }.reduce(_ || _)
-    e.valid && !e.bits.issued && !e.bits.ready() && scale_dep
-  }.reduce(_ || _)
-  val ex_blocked_scale_only = entries_ex.map { e =>
-    val scale_dep    = e.bits.deps_ld.zip(ld_is_scale).map { case (d, s) => d && s }.reduce(_ || _)
-    val nonscale_dep = e.bits.deps_ex.reduce(_ || _) || e.bits.deps_st.reduce(_ || _) ||
-      e.bits.deps_ld.zip(ld_is_scale).map { case (d, s) => d && !s }.reduce(_ || _)
-    e.valid && !e.bits.issued && !e.bits.ready() && scale_dep && !nonscale_dep
-  }.reduce(_ || _)
-  val ex_blocked_nonscale = entries_ex.map { e =>
-    val nonscale_dep = e.bits.deps_ex.reduce(_ || _) || e.bits.deps_st.reduce(_ || _) ||
-      e.bits.deps_ld.zip(ld_is_scale).map { case (d, s) => d && !s }.reduce(_ || _)
-    e.valid && !e.bits.issued && !e.bits.ready() && nonscale_dep
-  }.reduce(_ || _)
-  // EX pool empty => the unroller is not delivering matmuls (idle or stalled on ld_ahead/upstream).
-  val ex_pool_empty = !entries_ex.map(_.valid).reduce(_ || _)
-  io.counter.connectEventSignal(CounterEvent.MX_EX_BLOCKED_ON_SCALE_CYCLE, ex_blocked_on_scale)
-  io.counter.connectEventSignal(CounterEvent.MX_EX_BLOCKED_SCALE_ONLY_CYCLE, ex_blocked_scale_only)
-  io.counter.connectEventSignal(CounterEvent.MX_EX_BLOCKED_NONSCALE_CYCLE, ex_blocked_nonscale)
-  io.counter.connectEventSignal(CounterEvent.MX_EX_POOL_EMPTY_CYCLE, ex_pool_empty)
+    // Phase-0b DAE-inversion partition (observation-only): attribute the EX dependency stall to
+    // in-flight MX scale-mvins. A matmul's dep on an is_mx_scale load clears only on the scale
+    // DMA's COMPLETION (complete_on_issue=false at :400; cross-queue clear at :494-503), so a
+    // matmul gated on a live scale load is the decoupled-access-execute inversion we suspect.
+    // ld_is_scale[i] marks load-pool slot i as a still-in-flight scale-vector mvin.
+    val ld_is_scale = entries_ld.map(e => e.valid && isMxScaleEntry(e.bits))
+    val ex_blocked_on_scale = entries_ex.map { e =>
+      val scale_dep = e.bits.deps_ld.zip(ld_is_scale).map { case (d, s) => d && s }.reduce(_ || _)
+      e.valid && !e.bits.issued && !e.bits.ready() && scale_dep
+    }.reduce(_ || _)
+    val ex_blocked_scale_only = entries_ex.map { e =>
+      val scale_dep    = e.bits.deps_ld.zip(ld_is_scale).map { case (d, s) => d && s }.reduce(_ || _)
+      val nonscale_dep = e.bits.deps_ex.reduce(_ || _) || e.bits.deps_st.reduce(_ || _) ||
+        e.bits.deps_ld.zip(ld_is_scale).map { case (d, s) => d && !s }.reduce(_ || _)
+      e.valid && !e.bits.issued && !e.bits.ready() && scale_dep && !nonscale_dep
+    }.reduce(_ || _)
+    val ex_blocked_nonscale = entries_ex.map { e =>
+      val nonscale_dep = e.bits.deps_ex.reduce(_ || _) || e.bits.deps_st.reduce(_ || _) ||
+        e.bits.deps_ld.zip(ld_is_scale).map { case (d, s) => d && !s }.reduce(_ || _)
+      e.valid && !e.bits.issued && !e.bits.ready() && nonscale_dep
+    }.reduce(_ || _)
+    // EX pool empty => the unroller is not delivering matmuls (idle or stalled on ld_ahead/upstream).
+    val ex_pool_empty = !entries_ex.map(_.valid).reduce(_ || _)
+    io.counter.connectEventSignal(CounterEvent.MX_EX_BLOCKED_ON_SCALE_CYCLE, ex_blocked_on_scale)
+    io.counter.connectEventSignal(CounterEvent.MX_EX_BLOCKED_SCALE_ONLY_CYCLE, ex_blocked_scale_only)
+    io.counter.connectEventSignal(CounterEvent.MX_EX_BLOCKED_NONSCALE_CYCLE, ex_blocked_nonscale)
+    io.counter.connectEventSignal(CounterEvent.MX_EX_POOL_EMPTY_CYCLE, ex_pool_empty)
 
-  // RS LD/ST pool composition: is the RS full of (blocked) loads or (in-flight) stores?
-  val ld_blocked  = entries_ld.map(e => e.valid && !e.bits.issued && !e.bits.ready()).reduce(_ || _)
-  val st_inflight = entries_st.map(e => e.valid && e.bits.issued).reduce(_ || _)
-  io.counter.connectEventSignal(CounterEvent.MX_DBG_LD_POOL_FULL_CYCLE, full_ld)
-  io.counter.connectEventSignal(CounterEvent.MX_DBG_LD_BLOCKED_CYCLE, ld_blocked)
-  io.counter.connectEventSignal(CounterEvent.MX_DBG_ST_POOL_FULL_CYCLE, full_st)
-  io.counter.connectEventSignal(CounterEvent.MX_DBG_ST_INFLIGHT_CYCLE, st_inflight)
+    // RS LD/ST pool composition: is the RS full of (blocked) loads or (in-flight) stores?
+    val ld_blocked  = entries_ld.map(e => e.valid && !e.bits.issued && !e.bits.ready()).reduce(_ || _)
+    val st_inflight = entries_st.map(e => e.valid && e.bits.issued).reduce(_ || _)
+    io.counter.connectEventSignal(CounterEvent.MX_DBG_LD_POOL_FULL_CYCLE, full_ld)
+    io.counter.connectEventSignal(CounterEvent.MX_DBG_LD_BLOCKED_CYCLE, ld_blocked)
+    io.counter.connectEventSignal(CounterEvent.MX_DBG_ST_POOL_FULL_CYCLE, full_st)
+    io.counter.connectEventSignal(CounterEvent.MX_DBG_ST_INFLIGHT_CYCLE, st_inflight)
+  }
 }

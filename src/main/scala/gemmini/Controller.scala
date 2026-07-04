@@ -163,8 +163,8 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   // Counters
   val counters = Module(new CounterController(outer.config.num_counter, outer.xLen))
   io.resp <> counters.io.out  // Counter access command will be committed immediately
-  counters.io.event_io.external_values(0) := 0.U
-  counters.io.event_io.event_signal(0) := false.B
+  counters.io.event_io.external_values := 0.U.asTypeOf(counters.io.event_io.external_values.cloneType)
+  counters.io.event_io.event_signal := 0.U.asTypeOf(counters.io.event_io.event_signal.cloneType)
   counters.io.in.valid := false.B
   counters.io.in.bits := DontCare
   counters.io.event_io.collect(spad.module.io.counter)
@@ -271,19 +271,19 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   unrolled_cmd.ready := false.B
   counters.io.event_io.connectEventSignal(CounterEvent.LOOP_MATMUL_ACTIVE_CYCLES, loop_matmul_unroller_busy)
 
-  val mx_runtime_enabled = RegInit(false.B)
-  val mx_scale_stride_a = RegInit(0.U(coreMaxAddrBits.W))
-  val mx_scale_stride_b = RegInit(0.U(coreMaxAddrBits.W))
-  val mx_config_pulse = WireInit(false.B)
+  val mx_runtime_enabled = if (mx_enabled) Some(RegInit(false.B)) else None
+  val mx_scale_stride_a = if (mx_enabled) Some(RegInit(0.U(coreMaxAddrBits.W))) else None
+  val mx_scale_stride_b = if (mx_enabled) Some(RegInit(0.U(coreMaxAddrBits.W))) else None
+  val mx_config_pulse = if (mx_enabled) Some(WireInit(false.B)) else None
   // MX loop geometry (policy Appendix A), captured from CONFIG_MXINT8 rs2 on the plain
   // enable sub-command. 1/1/0 is the single-tile v1 shape; rs2 == 0 maps to it so
   // pre-Appendix-A callers are unchanged.
-  val mx_loop_i_tiles = RegInit(1.U(16.W))
-  val mx_loop_j_tiles = RegInit(1.U(16.W))
-  val mx_loop_log2_jp = RegInit(0.U(4.W))
+  val mx_loop_i_tiles = if (mx_enabled) Some(RegInit(1.U(16.W))) else None
+  val mx_loop_j_tiles = if (mx_enabled) Some(RegInit(1.U(16.W))) else None
+  val mx_loop_log2_jp = if (mx_enabled) Some(RegInit(0.U(4.W))) else None
   // K-block count of the next MX loop (P3): 0 = legacy (drain walk does not wrap kb; the
   // RESET_K pulse re-zeroes it), nonzero lets the walk self-cycle per loop (fenceless).
-  val mx_loop_k_blocks = RegInit(0.U(16.W))
+  val mx_loop_k_blocks = if (mx_enabled) Some(RegInit(0.U(16.W))) else None
 
   // Wire up controllers to ROB
   reservation_station.io.alloc.valid := false.B
@@ -314,7 +314,9 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   // Controllers
   //=========================================================================
   val load_controller = withClock (gated_clock) { Module(new LoadController(outer.config, coreMaxAddrBits, local_addr_t)) }
-  val mx_scale_load_controller = withClock (gated_clock) { Module(new MXScaleLoadController(outer.config, coreMaxAddrBits)) }
+  val mx_scale_load_controller = if (mx_enabled) Some(withClock (gated_clock) {
+    Module(new MXScaleLoadController(outer.config, coreMaxAddrBits))
+  }) else None
   val store_controller = withClock (gated_clock) { Module(new StoreController(outer.config, coreMaxAddrBits, local_addr_t)) }
   val ex_controller = withClock (gated_clock) { Module(new ExecuteController(xLen, tagWidth, outer.config)) }
   val mx_scale_sram = if (mx_enabled) Some(withClock (gated_clock) { Module(new MXScaleSRAM(outer.config)) }) else None
@@ -360,19 +362,27 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   }
   */
 
-  val ld_issue_is_mx_scale = mx_enabled.B && reservation_station.io.issue.ld.valid &&
-    (reservation_station.io.issue.ld.cmd.cmd.inst.funct === LOAD_MX_SCALE_A_CMD ||
-      reservation_station.io.issue.ld.cmd.cmd.inst.funct === LOAD_MX_SCALE_B_CMD)
+  val ld_issue_is_mx_scale = if (mx_enabled) {
+    reservation_station.io.issue.ld.valid &&
+      (reservation_station.io.issue.ld.cmd.cmd.inst.funct === LOAD_MX_SCALE_A_CMD ||
+        reservation_station.io.issue.ld.cmd.cmd.inst.funct === LOAD_MX_SCALE_B_CMD)
+  } else false.B
 
   load_controller.io.cmd.valid := reservation_station.io.issue.ld.valid && !ld_issue_is_mx_scale
-  mx_scale_load_controller.io.cmd.valid := reservation_station.io.issue.ld.valid && ld_issue_is_mx_scale
-  reservation_station.io.issue.ld.ready := Mux(ld_issue_is_mx_scale, mx_scale_load_controller.io.cmd.ready, load_controller.io.cmd.ready)
   load_controller.io.cmd.bits := reservation_station.io.issue.ld.cmd
   load_controller.io.cmd.bits.rob_id.push(reservation_station.io.issue.ld.rob_id)
-  mx_scale_load_controller.io.cmd.bits := reservation_station.io.issue.ld.cmd
-  mx_scale_load_controller.io.cmd.bits.rob_id.push(reservation_station.io.issue.ld.rob_id)
-  mx_scale_load_controller.io.stride_a := mx_scale_stride_a
-  mx_scale_load_controller.io.stride_b := mx_scale_stride_b
+  if (mx_enabled) {
+    val scale_load = mx_scale_load_controller.get
+    scale_load.io.cmd.valid := reservation_station.io.issue.ld.valid && ld_issue_is_mx_scale
+    scale_load.io.cmd.bits := reservation_station.io.issue.ld.cmd
+    scale_load.io.cmd.bits.rob_id.push(reservation_station.io.issue.ld.rob_id)
+    scale_load.io.stride_a := mx_scale_stride_a.get
+    scale_load.io.stride_b := mx_scale_stride_b.get
+    reservation_station.io.issue.ld.ready := Mux(ld_issue_is_mx_scale, scale_load.io.cmd.ready,
+      load_controller.io.cmd.ready)
+  } else {
+    reservation_station.io.issue.ld.ready := load_controller.io.cmd.ready
+  }
 
   store_controller.io.cmd.valid := reservation_station.io.issue.st.valid
   reservation_station.io.issue.st.ready := store_controller.io.cmd.ready
@@ -388,18 +398,19 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   spad.module.io.dma.read <> load_controller.io.dma
   spad.module.io.dma.write <> store_controller.io.dma
   if (mx_enabled) {
+    val scale_load = mx_scale_load_controller.get
     val mx = spad.module.io.mx.get
-    mx.read <> mx_scale_load_controller.io.dma
+    mx.read <> scale_load.io.dma
     mx.write <> mx_scale_sram.get.io.write
 
     val ex_mx = ex_controller.io.mx.get
     val scale_sram = mx_scale_sram.get
-    ex_mx.enable := mx_runtime_enabled
-    ex_mx.reset := mx_config_pulse
-    ex_mx.i_tiles := mx_loop_i_tiles
-    ex_mx.j_tiles := mx_loop_j_tiles
-    ex_mx.log2_jp := mx_loop_log2_jp
-    ex_mx.k_blocks := mx_loop_k_blocks
+    ex_mx.enable := mx_runtime_enabled.get
+    ex_mx.reset := mx_config_pulse.get
+    ex_mx.i_tiles := mx_loop_i_tiles.get
+    ex_mx.j_tiles := mx_loop_j_tiles.get
+    ex_mx.log2_jp := mx_loop_log2_jp.get
+    ex_mx.k_blocks := mx_loop_k_blocks.get
     scale_sram.io.read_a <> ex_mx.read_a
     scale_sram.io.read_b <> ex_mx.read_b
     ex_mx.resp_a := scale_sram.io.resp_a
@@ -407,14 +418,8 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     // Scale-SRAM ping-pong WAR interlock: the load controller throttles a new chunk's
     // A-scale-mvin against the ExecuteController's per-chunk drain pulse, replacing the CPU
     // gemmini_fence(). Active only for the pipelined (k_blocks != 0) drain walk.
-    mx_scale_load_controller.io.pipelined := mx_loop_k_blocks =/= 0.U
-    mx_scale_load_controller.io.loop_drained := ex_mx.loop_drained
-  } else {
-    mx_scale_load_controller.io.dma.req.ready := false.B
-    mx_scale_load_controller.io.dma.resp.valid := false.B
-    mx_scale_load_controller.io.dma.resp.bits := DontCare
-    mx_scale_load_controller.io.pipelined := false.B
-    mx_scale_load_controller.io.loop_drained := false.B
+    scale_load.io.pipelined := mx_loop_k_blocks.get =/= 0.U
+    scale_load.io.loop_drained := ex_mx.loop_drained
   }
   ex_controller.io.srams.read <> spad.module.io.srams.read
   ex_controller.io.srams.write <> spad.module.io.srams.write
@@ -477,28 +482,35 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
   //-------------------------------------------------------------------------
   // risc
-  val reservation_station_completed_arb = Module(new Arbiter(UInt(log2Up(reservation_station_entries).W), 4))
+  val reservation_station_completed_arb = Module(new Arbiter(UInt(log2Up(reservation_station_entries).W),
+    if (mx_enabled) 4 else 3))
 
   reservation_station_completed_arb.io.in(0).valid := ex_controller.io.completed.valid
   reservation_station_completed_arb.io.in(0).bits := ex_controller.io.completed.bits
 
   reservation_station_completed_arb.io.in(1) <> load_controller.io.completed
   reservation_station_completed_arb.io.in(2) <> store_controller.io.completed
-  reservation_station_completed_arb.io.in(3) <> mx_scale_load_controller.io.completed
+  if (mx_enabled) {
+    reservation_station_completed_arb.io.in(3) <> mx_scale_load_controller.get.io.completed
+  }
 
   // mux with cisc frontend arbiter
   reservation_station_completed_arb.io.in(0).valid := ex_controller.io.completed.valid // && !is_cisc_mode
   reservation_station_completed_arb.io.in(1).valid := load_controller.io.completed.valid // && !is_cisc_mode
   reservation_station_completed_arb.io.in(2).valid := store_controller.io.completed.valid // && !is_cisc_mode
-  reservation_station_completed_arb.io.in(3).valid := mx_scale_load_controller.io.completed.valid // && !is_cisc_mode
+  if (mx_enabled) {
+    reservation_station_completed_arb.io.in(3).valid := mx_scale_load_controller.get.io.completed.valid // && !is_cisc_mode
+  }
 
   reservation_station.io.completed.valid := reservation_station_completed_arb.io.out.valid
   reservation_station.io.completed.bits := reservation_station_completed_arb.io.out.bits
   reservation_station_completed_arb.io.out.ready := true.B
 
+  val mx_scale_load_busy = if (mx_enabled) mx_scale_load_controller.get.io.busy else false.B
+
   // Wire up global RoCC signals
   io.busy := raw_cmd.valid || loop_conv_unroller_busy || loop_matmul_unroller_busy ||
-    reservation_station.io.busy || spad.module.io.busy || mx_scale_load_controller.io.busy ||
+    reservation_station.io.busy || spad.module.io.busy || mx_scale_load_busy ||
     unrolled_cmd.valid || loop_cmd.valid || conv_cmd.valid
 
   io.interrupt := tlb.io.exp.map(_.interrupt).reduce(_ || _)
@@ -506,7 +518,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   // assert(!io.interrupt, "Interrupt handlers have not been written yet")
 
   // Cycle counters
-  val ld_busy = load_controller.io.busy || mx_scale_load_controller.io.busy
+  val ld_busy = load_controller.io.busy || mx_scale_load_busy
 
   val incr_ld_cycles = ld_busy && !store_controller.io.busy && !ex_controller.io.busy
   val incr_st_cycles = !ld_busy && store_controller.io.busy && !ex_controller.io.busy
@@ -527,13 +539,24 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   counters.io.event_io.connectEventSignal(CounterEvent.MAIN_LD_ST_EX_CYCLES, incr_ld_st_ex_cycles)
 
   // MX scale-load diagnostics: is the scale load on the critical path, or overlapped?
-  val mx_scale_busy = mx_scale_load_controller.io.busy
-  counters.io.event_io.connectEventSignal(CounterEvent.MX_SCALE_DMA_ACTIVE_CYCLE, mx_scale_busy)
-  counters.io.event_io.connectEventSignal(CounterEvent.MX_SCALE_DMA_SOLO_CYCLE, mx_scale_busy && !ex_controller.io.busy)
+  if (mx_enabled) {
+    counters.io.event_io.connectEventSignal(CounterEvent.MX_SCALE_DMA_ACTIVE_CYCLE, mx_scale_load_busy)
+    counters.io.event_io.connectEventSignal(CounterEvent.MX_SCALE_DMA_SOLO_CYCLE,
+      mx_scale_load_busy && !ex_controller.io.busy)
+  }
 
   // Issue commands to controllers
   // TODO we combinationally couple cmd.ready and cmd.valid signals here
   // when (compressed_cmd.valid) {
+  def allocateReservationStationCommand(): Unit = {
+    reservation_station.io.alloc.valid := true.B
+
+    when(reservation_station.io.alloc.fire) {
+      // compressed_cmd.ready := true.B
+      unrolled_cmd.ready := true.B
+    }
+  }
+
   when (unrolled_cmd.valid) {
     // val config_cmd_type = cmd.bits.rs1(1,0) // TODO magic numbers
 
@@ -543,7 +566,6 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     val is_flush = risc_funct === FLUSH_CMD
     val is_counter_op = risc_funct === COUNTER_OP
     val is_clock_gate_en = risc_funct === CLKGATE_EN
-    val is_mx_config = mx_enabled.B && risc_funct === CONFIG_MXINT8_CMD
 
     /*
     val is_load = (funct === LOAD_CMD) || (funct === CONFIG_CMD && config_cmd_type === CONFIG_LOAD)
@@ -571,45 +593,44 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
       unrolled_cmd.ready := true.B
     }
 
-    .elsewhen (is_mx_config) {
-      val enable = unrolled_cmd.bits.cmd.rs1(0)
-      val set_stride = unrolled_cmd.bits.cmd.rs1(1)
-      val stride_is_b = unrolled_cmd.bits.cmd.rs1(2)
-      val reset_mx = unrolled_cmd.bits.cmd.rs1(3)
-
-      mx_runtime_enabled := enable
-      mx_config_pulse := enable && reset_mx
-      when (set_stride) {
-        when (stride_is_b) {
-          mx_scale_stride_b := unrolled_cmd.bits.cmd.rs2
-        } .otherwise {
-          mx_scale_stride_a := unrolled_cmd.bits.cmd.rs2
-        }
-      } .elsewhen (enable) {
-        // Plain enable sub-command: rs2 = {K_blocks[55:40], log2_Jp[35:32], J_tiles[31:16],
-        // I_tiles[15:0]}. Zero fields decay to the single-tile shape (1 tile, dense pitch);
-        // K_blocks == 0 keeps the legacy non-wrapping walk (RESET_K still re-zeroes it).
-        val cfg_i_tiles = unrolled_cmd.bits.cmd.rs2(15, 0)
-        val cfg_j_tiles = unrolled_cmd.bits.cmd.rs2(31, 16)
-        val cfg_log2_jp = unrolled_cmd.bits.cmd.rs2(35, 32)
-        val cfg_k_blocks = unrolled_cmd.bits.cmd.rs2(55, 40)
-        mx_loop_i_tiles := Mux(cfg_i_tiles === 0.U, 1.U, cfg_i_tiles)
-        mx_loop_j_tiles := Mux(cfg_j_tiles === 0.U, 1.U, cfg_j_tiles)
-        mx_loop_log2_jp := cfg_log2_jp
-        mx_loop_k_blocks := cfg_k_blocks
-        assert(cfg_j_tiles <= (1.U << cfg_log2_jp).asUInt || cfg_j_tiles === 0.U,
-          "CONFIG_MXINT8: J_tiles must fit the padded power-of-two pitch 2^log2_Jp")
-      }
-
-      unrolled_cmd.ready := true.B
-    }
-
     .otherwise {
-      reservation_station.io.alloc.valid := true.B
+      if (mx_enabled) {
+        when (risc_funct === CONFIG_MXINT8_CMD) {
+          val enable = unrolled_cmd.bits.cmd.rs1(0)
+          val set_stride = unrolled_cmd.bits.cmd.rs1(1)
+          val stride_is_b = unrolled_cmd.bits.cmd.rs1(2)
+          val reset_mx = unrolled_cmd.bits.cmd.rs1(3)
 
-      when(reservation_station.io.alloc.fire) {
-        // compressed_cmd.ready := true.B
-        unrolled_cmd.ready := true.B
+          mx_runtime_enabled.get := enable
+          mx_config_pulse.get := enable && reset_mx
+          when (set_stride) {
+            when (stride_is_b) {
+              mx_scale_stride_b.get := unrolled_cmd.bits.cmd.rs2
+            } .otherwise {
+              mx_scale_stride_a.get := unrolled_cmd.bits.cmd.rs2
+            }
+          } .elsewhen (enable) {
+            // Plain enable sub-command: rs2 = {K_blocks[55:40], log2_Jp[35:32], J_tiles[31:16],
+            // I_tiles[15:0]}. Zero fields decay to the single-tile shape (1 tile, dense pitch);
+            // K_blocks == 0 keeps the legacy non-wrapping walk (RESET_K still re-zeroes it).
+            val cfg_i_tiles = unrolled_cmd.bits.cmd.rs2(15, 0)
+            val cfg_j_tiles = unrolled_cmd.bits.cmd.rs2(31, 16)
+            val cfg_log2_jp = unrolled_cmd.bits.cmd.rs2(35, 32)
+            val cfg_k_blocks = unrolled_cmd.bits.cmd.rs2(55, 40)
+            mx_loop_i_tiles.get := Mux(cfg_i_tiles === 0.U, 1.U, cfg_i_tiles)
+            mx_loop_j_tiles.get := Mux(cfg_j_tiles === 0.U, 1.U, cfg_j_tiles)
+            mx_loop_log2_jp.get := cfg_log2_jp
+            mx_loop_k_blocks.get := cfg_k_blocks
+            assert(cfg_j_tiles <= (1.U << cfg_log2_jp).asUInt || cfg_j_tiles === 0.U,
+              "CONFIG_MXINT8: J_tiles must fit the padded power-of-two pitch 2^log2_Jp")
+          }
+
+          unrolled_cmd.ready := true.B
+        } .otherwise {
+          allocateReservationStationCommand()
+        }
+      } else {
+        allocateReservationStationCommand()
       }
     }
   }
