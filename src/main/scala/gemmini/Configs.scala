@@ -276,8 +276,8 @@ object GemminiConfigs {
     mx_block_size = 32,
     mx_scale_bits = 8,
     mx_int_frac_bits = 6,
-    mx_scale_sp_capacity = CapacityInKilobytes(8),
-    reservation_station_entries_st = 8,
+    mx_scale_sp_capacity = CapacityInKilobytes(4),
+    reservation_station_entries_st = 16,
     st_queue_length = 4,
     headerFileName = "gemmini_params_mxint8_dim16.h"
   )
