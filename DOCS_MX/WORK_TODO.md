@@ -15,6 +15,9 @@ limitations and known caveats belong in `KNOWN_ISSUES.md`.
   MXINT8. Result: `DOCS_MX/scripts/results/perf_i20.csv`.
 - [x] Re-run corrected DIM32/DIM16 OOC synthesis/resource data with Vivado.
   Result: `DOCS_MX/scripts/results/synth_i20.csv`.
+- [x] Complete the PLAN_1 DIM16 optimization campaign. Final selected result is
+  DIM32 MX `4229 / 9689 / 37919` and DIM16 MX `4438 / 13724 / 88379`, with
+  detailed iteration evidence in `PLAN_1.md`.
 - [ ] Extend fresh performance/synthesis/regression evidence to DIM8/DIM4 after
   stock DIM8/DIM4 params headers and fair baseline configs are finalized.
 - [ ] If fresh `perf.csv` and `synth.csv` are intentionally produced, regenerate
@@ -35,9 +38,9 @@ limitations and known caveats belong in `KNOWN_ISSUES.md`.
   and decide whether any wider-accumulator option is worth the area/timing cost.
 - [ ] P5 transpose/OS decision: either add one supported transpose/output-stationary
   path or explicitly scope the project and paper claims to untransposed WS GEMM.
-- [ ] Evaluate whether the remaining DIM16 large-shape gap matters for the thesis.
-  DIM32 is now faster than pure stock on the measured square smoke tests, but
-  DIM16 still trails stock at 128^3 and 256^3.
+- [ ] Decide the publication stance for the remaining DIM16 large-shape gap.
+  PLAN_1 reduced the DIM16 stock gap to 824 cycles at `128^3` and 9,926 cycles
+  at `256^3`, while DIM32 remains at or better than the I20 target.
 - [ ] Study deeper scale-SRAM ping-pong only if there is a concrete workload that
   needs it. The existing depth-2 interlock is correct, but 256^3 DIM32 is scale
   capacity bound with two halves.

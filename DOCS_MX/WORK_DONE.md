@@ -15,12 +15,75 @@ Current code anchors:
 Long Verilator/Vivado jobs were rerun for the July 4 DIM32/DIM16 final-candidate
 pass; older sections below are retained as historical context.
 
-## July 4 Final Candidate
+## July 4 PLAN_1 DIM16 Campaign Final Candidate
 
-The best measured implementation after the 20-iteration optimization campaign is
-the restored I14 candidate: pure stock keeps upstream `reservation_station_entries_st=4`,
-while MX DIM32/DIM16 explicitly use `reservation_station_entries_st=8` and
-`st_queue_length=4`.
+The second 20-iteration campaign is documented in `PLAN_1.md`. It focused on
+the DIM16 large-shape slowdown while preserving DIM32 MX behavior and stock INT8
+purity.
+
+Selected implementation:
+
+- DIM16 MX scale SRAM capacity reduced to 4KB:
+  `mx_scale_sp_capacity = CapacityInKilobytes(4)`.
+- DIM16 MX store reservation station increased to 16 entries:
+  `reservation_station_entries_st = 16`.
+- DIM16 pair-J MX software schedule keeps the J19 relaxed pair-group barrier:
+  `do_fence = k_chunked || first_chunk || !geom_same`.
+- Stock INT8 configs remain pure and must keep `MX_ENABLED 0`.
+
+Final PLAN_1 performance evidence:
+
+| DIM | Impl | 64^3 | 128^3 | 256^3 |
+|---|---|---:|---:|---:|
+| 32 | MX final | 4,229 | 9,689 | 37,919 |
+| 16 | MX final | 4,438 | 13,724 | 88,379 |
+
+Compared with the I20 MX starting point, DIM16 changes are `+48`, `-625`, and
+`-13,186` cycles for `64^3`, `128^3`, and `256^3`. Compared with pure stock
+DIM16, final MX is 1,650 cycles faster at `64^3`, 824 cycles slower at `128^3`,
+and 9,926 cycles slower at `256^3`.
+
+Final DIM16 instruction-count evidence was collected with
+`MX_BENCH_COUNTER_SET=3` using
+`DOCS_MX/scripts/results/perf_plan1_final_dim16_inst.csv` and the matching
+`MXINST` simulator log lines. MX retires more host instructions than stock, but
+the count remains small relative to accelerator cycles:
+
+| Shape | Stock instret | MX instret | MX/stock instret |
+|---|---:|---:|---:|
+| `64^3` | 351 | 473 | 1.348x |
+| `128^3` | 832 | 1,394 | 1.675x |
+| `256^3` | 2,551 | 3,710 | 1.454x |
+
+This supports keeping custom MX/RoCC macro-instructions as a possible later
+co-design topic, but not as the first explanation for the final DIM16 gap: at
+`256^3`, 3,710 retired MX host instructions span 88,206 measured cycles.
+
+Final PLAN_1 area evidence is the banked J14 hardware/config synthesis point:
+`DOCS_MX/scripts/results/synth_plan1_j14_dim16.csv` reports
+`117643 LUT / 63162 FF / 167.5 BRAM36 / 239 DSP`. The J19 final software
+schedule does not change hardware area.
+
+Final PLAN_1 correctness evidence:
+
+- DIM16 regression passed `mxint8_matmul_dim16`, `mxint8_multitile`, and
+  `mxint8_matmul_nphase`.
+- DIM32 regression passed `mxint8_golden`, `mxint8_matmul_dim32`,
+  `mxint8_corner`, `mxint8_matmul_partial`, `mxint8_tiled`, `mxint8_btb`,
+  `mxint8_multitile`, and `mxint8_matmul_nphase`.
+- All long simulations, generated headers, logs, and scratch stayed under
+  `sims/verilator/gemmini`.
+
+J20 tested a small-shape shape gate for the J19 barrier relaxation, but it was
+reverted because it recovered only 12 cycles at DIM16 `64^3` while losing
+142/176 cycles on the target `128^3`/`256^3` shapes.
+
+## July 4 I20 Baseline Before PLAN_1
+
+The best measured implementation after the earlier `PLAN.md` I20 campaign was
+the restored I14 candidate: pure stock kept upstream
+`reservation_station_entries_st=4`, while MX DIM32/DIM16 explicitly used
+`reservation_station_entries_st=8` and `st_queue_length=4`.
 
 Fresh corrected performance evidence is in `DOCS_MX/scripts/results/perf_i20.csv`:
 

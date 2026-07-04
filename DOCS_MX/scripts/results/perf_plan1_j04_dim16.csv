@@ -1,0 +1,4 @@
+config,impl,dim,M,N,K,cycles,macs,ideal_cycles,util_pct,result
+GemminiMXINT8DIM16RocketConfig,mx,16,64,64,64,4481,262144,1024,22,PASS
+GemminiMXINT8DIM16RocketConfig,mx,16,128,128,128,14453,2097152,8192,56,PASS
+GemminiMXINT8DIM16RocketConfig,mx,16,256,256,256,94320,16777216,65536,69,PASS

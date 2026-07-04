@@ -1,0 +1,2 @@
+config,part,clk_ns,lut,ff,bram36,dsp,wns_ns,fmax_mhz
+GemminiMXINT8DIM16RocketConfig,xc7a200tsbg484-1,10.0,121197,60946,168,239,-39.464,20.2167

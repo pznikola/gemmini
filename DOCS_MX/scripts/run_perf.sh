@@ -84,12 +84,36 @@ build_bench() {  # build_bench <header-file>
   local hdr="$TESTS_DIR/include/$1"
   local safe_hdr="${1//[^A-Za-z0-9_.-]/_}"
   local saved="$TMP_DIR/gemmini_params.saved.h"
-  local build_args=()
+  local extra_cflags="${MX_EXTRA_CFLAGS:-}"
   [ -f "$hdr" ] || { echo "  missing header $hdr"; return 1; }
-  [ -z "${MX_EXTRA_CFLAGS:-}" ] || build_args+=("EXTRA_CFLAGS=$MX_EXTRA_CFLAGS")
+  if [ -n "${MX_BENCH_COUNTER_SET:-}" ]; then
+    case "$MX_BENCH_COUNTER_SET" in
+      0|1|2|3) ;;
+      *) echo "  invalid MX_BENCH_COUNTER_SET=$MX_BENCH_COUNTER_SET (use 0, 1, 2, or 3)" >&2; return 1 ;;
+    esac
+    extra_cflags="${extra_cflags:+$extra_cflags }-DMX_BENCH_COUNTER_SET=$MX_BENCH_COUNTER_SET"
+  fi
+  if [ -n "${MX_BENCH_PRINT_GEOM:-}" ]; then
+    case "$MX_BENCH_PRINT_GEOM" in
+      0|1) ;;
+      *) echo "  invalid MX_BENCH_PRINT_GEOM=$MX_BENCH_PRINT_GEOM (use 0 or 1)" >&2; return 1 ;;
+    esac
+    extra_cflags="${extra_cflags:+$extra_cflags }-DMX_BENCH_PRINT_GEOM=$MX_BENCH_PRINT_GEOM"
+  fi
+  if [ -n "${MX_BENCH_CPU_TIMING:-}" ]; then
+    case "$MX_BENCH_CPU_TIMING" in
+      0|1) ;;
+      *) echo "  invalid MX_BENCH_CPU_TIMING=$MX_BENCH_CPU_TIMING (use 0 or 1)" >&2; return 1 ;;
+    esac
+    extra_cflags="${extra_cflags:+$extra_cflags }-DMX_BENCH_CPU_TIMING=$MX_BENCH_CPU_TIMING"
+  fi
   cp "$TESTS_DIR/include/gemmini_params.h" "$saved"
   cp "$hdr" "$TESTS_DIR/include/gemmini_params.h"
-  ( cd "$TESTS_DIR" && ./build.sh "${build_args[@]}" ) > "$LOG_DIR/mx_perf_build_$safe_hdr.log" 2>&1
+  if [ -n "$extra_cflags" ]; then
+    ( cd "$TESTS_DIR" && EXTRA_CFLAGS="$extra_cflags" ./build.sh ) > "$LOG_DIR/mx_perf_build_$safe_hdr.log" 2>&1
+  else
+    ( cd "$TESTS_DIR" && ./build.sh ) > "$LOG_DIR/mx_perf_build_$safe_hdr.log" 2>&1
+  fi
   local rc=$?
   cp "$saved" "$TESTS_DIR/include/gemmini_params.h"
   return $rc
